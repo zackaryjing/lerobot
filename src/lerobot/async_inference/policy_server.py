@@ -378,7 +378,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             processed_actions.append(processed_action)
 
         # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+        # Actions cross a process and usually a machine boundary. Keep the wire
+        # representation device-agnostic so a CPU-only robot client can
+        # deserialize results produced by a CUDA policy server.
+        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         """5. Convert to TimedAction list"""

@@ -217,3 +217,4 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+        assert ta.get_action().device.type == "cpu"
