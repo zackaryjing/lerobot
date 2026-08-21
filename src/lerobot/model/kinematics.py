@@ -103,6 +103,11 @@ class RobotKinematics:
         for i, joint_name in enumerate(self.joint_names):
             self.robot.set_joint(joint_name, current_joint_rad[i])
 
+        # Placo's solver linearizes tasks around the robot's current kinematic
+        # state. Updating joint values alone leaves frame transforms stale and
+        # can make the first solve jump to an unrelated local solution.
+        self.robot.update_kinematics()
+
         # Update the target pose for the frame task
         self.tip_frame.T_world_frame = desired_ee_pose
 

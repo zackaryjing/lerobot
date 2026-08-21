@@ -352,7 +352,7 @@ class FeetechMotorsBus(MotorsBus):
         addr, length = get_address(self.model_ctrl_table, model, "Lock")
         self._write(addr, length, motor_id, 0, num_retry=num_retry)
 
-    def enable_torque(self, motors: str | list[str] | None = None, num_retry: int = 0) -> None:
+    def enable_torque(self, motors: str | list[str] | None = None, num_retry: int = 3) -> None:
         for motor in self._get_motors_list(motors):
             self.write("Torque_Enable", motor, TorqueMode.ENABLED.value, num_retry=num_retry)
             self.write("Lock", motor, 1, num_retry=num_retry)
