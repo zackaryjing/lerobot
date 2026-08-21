@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>SO101 方向控制</title>
+<style>
+*{box-sizing:border-box}html,body{width:100%;max-width:100%;overflow-x:hidden}body{margin:0;background:#111827;color:#e5e7eb;font:15px system-ui;padding:18px;touch-action:manipulation}
+.card{width:100%;max-width:620px;overflow:hidden;margin:auto;background:#1f2937;border-radius:14px;padding:18px;box-shadow:0 10px 30px #0008}
+h2{margin:0 0 8px}.hint{color:#9ca3af;font-size:13px;line-height:1.5}.row{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+button{flex:1;min-width:130px;padding:14px;border:0;border-radius:9px;color:white;font-size:15px;font-weight:600;background:#374151}
+button.primary{background:#2563eb}button.danger{background:#dc2626}button:disabled{opacity:.35}.ok{color:#4ade80}.bad{color:#f87171}
+select{max-width:100%;padding:12px;background:#111827;color:white;border:1px solid #4b5563;border-radius:8px}.data{width:100%;max-width:100%;overflow-x:hidden;overflow-wrap:anywhere;word-break:break-word;font:12px monospace;line-height:1.7;background:#111827;padding:12px;border-radius:8px;white-space:pre-wrap}
+#xr-canvas{position:fixed;left:0;top:0;width:2px;height:2px;opacity:.01;pointer-events:none}
+</style>
+</head>
+<body><canvas id="xr-canvas" width="2" height="2"></canvas><div class="card">
+<h2>SO101 手机方向控制</h2>
+<div class="hint">仅使用 Android WebXR inline 朝向。标定时把手机屏幕朝上，手机顶部边缘指向机器人基座正前方；它将对应夹爪闭合后的尖端方向。标定前不能启用同步。</div>
+<div class="row"><button id="start" class="primary">1. 启动方向传感器</button><button id="calibrate" disabled>2. 标定</button></div>
+<div id="calib-help" class="hint">需要先启动方向传感器并收到至少一个 XR pose。</div>
+<div class="row"><button id="sync" class="primary" disabled>启用同步</button><button id="reset" class="danger">复位到启动姿态</button></div>
+<div class="row"><label>跟随模式： <select id="mode"><option value="smooth">柔和恒速追踪</option><option value="realtime">实时低通跟随</option></select></label></div>
+<div id="message" class="hint">正在连接服务器…</div>
+<div id="data" class="data">尚无状态</div>
+</div>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+let ws=null,session=null,space=null,xrGL=null,lastQuat=null,serverStatus={};
+const clientId=crypto.randomUUID();
+let wsConnected=false,frameCount=0,poseCount=0,reconnectCount=0,lastClose='-',desiredSync=false,resumePending=false;
+let heartbeatTimer=null,watchdogTimer=null,reconnectTimer=null,poseSentSinceOpen=false;
+let lastPongAt=0,reconnectAttempt=0,lastPoseSentAt=-Infinity,lastRenderAt=-Infinity;
+function message(text,ok=true){$('message').textContent=text;$('message').className=ok?'ok':'bad'}
+function connect(){
+  if(ws?.readyState===WebSocket.OPEN||ws?.readyState===WebSocket.CONNECTING)return;
+  ws=new WebSocket(`wss://${location.host}/ws?client_id=${encodeURIComponent(clientId)}`);
+  ws.onopen=()=>{
+    wsConnected=true;poseSentSinceOpen=false;resumePending=desiredSync;lastPongAt=Date.now();reconnectAttempt=0;message(reconnectCount?'服务器已重连；将继续上次同步目标':'服务器已连接（请确认 HARDWARE / DRY-RUN 状态）');renderStatus();
+    clearInterval(heartbeatTimer);heartbeatTimer=setInterval(()=>send({type:'ping',time:Date.now()}),3000);
+    clearInterval(watchdogTimer);watchdogTimer=setInterval(()=>{if(ws?.readyState===WebSocket.OPEN&&Date.now()-lastPongAt>12000)ws.close(4000,'heartbeat timeout')},1000);
+  };
+  ws.onclose=e=>{
+    wsConnected=false;reconnectCount++;reconnectAttempt++;lastClose=`code=${e.code} reason=${e.reason||'-'}`;clearInterval(heartbeatTimer);clearInterval(watchdogTimer);
+    message('服务器断开；机械臂将完成最后目标后保持，正在快速重连',false);renderStatus();
+    const delay=Math.min(2000,250*2**Math.min(reconnectAttempt,3));clearTimeout(reconnectTimer);reconnectTimer=setTimeout(connect,delay);
+  };
+  ws.onmessage=e=>{
+    const m=JSON.parse(e.data);
+    if(m.type==='pong')lastPongAt=Date.now();
+    if(m.type==='command_result')message(m.message,m.ok);
+    if(m.type==='status'){
+      serverStatus=m;
+      if(resumePending&&desiredSync&&poseSentSinceOpen&&m.calibrated&&m.phone_fresh&&!m.sync_enabled){resumePending=false;send({type:'sync',enabled:true})}
+      renderStatus()
+    }
+  };
+}
+function send(obj){if(ws?.readyState===WebSocket.OPEN){ws.send(JSON.stringify(obj));if(obj.type==='orientation')poseSentSinceOpen=true}}
+function renderStatus(){
+  $('calibrate').disabled=!wsConnected||!lastQuat||!!serverStatus.sync_enabled;
+  $('sync').disabled=!serverStatus.calibrated;
+  $('sync').textContent=serverStatus.sync_enabled?'关闭同步':'启用同步';
+  if(!wsConnected)$('calib-help').textContent='WebSocket 未连接，不能标定。';
+  else if(!session)$('calib-help').textContent='请先点击“启动方向传感器”。';
+  else if(!lastQuat)$('calib-help').textContent='XR session 已启动，但尚未返回方向 pose。';
+  else if(serverStatus.sync_enabled)$('calib-help').textContent='同步期间不能重新标定；请先关闭同步。';
+  else if(!serverStatus.phone_fresh)$('calib-help').textContent='已取得本地方向，正在等待服务器收到数据…';
+  else $('calib-help').textContent='方向数据正常，可以标定。';
+  const jointLines=Object.entries(serverStatus.joints_deg||{}).map(([name,value])=>`  ${name}: ${value}`);
+  $('data').textContent=[
+    `运行环境: ${serverStatus.hardware?'HARDWARE':'DRY-RUN'}`,
+    `已标定: ${!!serverStatus.calibrated}  同步: ${!!serverStatus.sync_enabled}`,
+    `WebSocket: ${wsConnected?'connected':'disconnected'}`,
+    `服务端链路: ${serverStatus.phone_transport_connected?'connected':'disconnected'}  数据年龄: ${serverStatus.phone_stale_age_s??'-'}s`,
+    `重连参考系重对齐: ${serverStatus.phone_rebase_count||0}  最近跳变: ${serverStatus.last_phone_rebase_deg||0}°`,
+    `重连次数: ${reconnectCount}  最后断开: ${lastClose}`,
+    `XR frame/pose: ${frameCount}/${poseCount}`,
+    `模式: ${serverStatus.mode||'-'}  后端: ${serverStatus.tracking_backend||'-'}  服务端手机数据: ${serverStatus.phone_fresh?'fresh':'stale'}`,
+    `正常操作限位内: ${!!serverStatus.inside_operational_limits}`,
+    `命令跟踪误差: ${serverStatus.max_command_tracking_error_deg??'-'}°`,
+    `SDK发送目标: ${JSON.stringify(serverStatus.sent_joints_deg||{})}`,
+    `位置约束: 无（仅跟随末端朝向）`,
+    `状态: ${serverStatus.status||'-'}`,
+    `拒绝次数: ${serverStatus.reject_count||0}`,
+    `拒绝分类: ${JSON.stringify(serverStatus.rejection_counts||{})}`,
+    `最后拒绝: ${serverStatus.last_rejection||'-'}`,
+    `最近保护原因: ${serverStatus.last_error||'-'}`,
+    '关节:',
+    ...jointLines,
+    `quat: ${lastQuat?lastQuat.map(v=>v.toFixed(4)).join(', '):'-'}`
+  ].join('\n');
+}
+async function startSensors(){
+  if(!navigator.xr){message('浏览器没有 WebXR；请使用支持 ARCore 的 Android Chrome',false);return}
+  const supported=await navigator.xr.isSessionSupported('inline');
+  if(!supported){message('该浏览器不支持 inline WebXR',false);return}
+  // Match the known-working inline path in phone_pose_viz: WebXR features
+  // must be requested when the session is created, not afterwards.
+  session=await navigator.xr.requestSession('inline',{
+    requiredFeatures:['local'],
+    optionalFeatures:['local-floor']
+  });
+  // Chrome/ARCore on some Android devices does not drive the XR frame loop
+  // until the session has an XR-compatible WebGL render layer.
+  const canvas=$('xr-canvas');
+  xrGL=canvas.getContext('webgl2',{xrCompatible:true})||canvas.getContext('webgl',{xrCompatible:true});
+  if(!xrGL)throw new Error('无法创建 WebGL context，XR 帧循环不能启动');
+  if(xrGL.makeXRCompatible)await xrGL.makeXRCompatible();
+  session.updateRenderState({baseLayer:new XRWebGLLayer(session,xrGL)});
+  space=await session.requestReferenceSpace('local');
+  session.requestAnimationFrame(onFrame);
+  $('start').disabled=true;
+  message('方向传感器已启动；请摆好手机后点击标定');
+  setTimeout(()=>{
+    if(frameCount===0)message('XR session 已建立，但渲染层没有产生帧；请关闭页面后重试',false);
+  },1500);
+}
+function onFrame(_time,frame){
+  frameCount++;
+  // A minimal clear keeps the XR layer active without displaying camera data.
+  xrGL.bindFramebuffer(xrGL.FRAMEBUFFER,session.renderState.baseLayer.framebuffer);
+  xrGL.clearColor(0,0,0,0);
+  xrGL.clear(xrGL.COLOR_BUFFER_BIT);
+  const pose=frame.getViewerPose(space);
+  if(pose){poseCount++;const o=pose.transform.orientation;lastQuat=[o.x,o.y,o.z,o.w];if(_time-lastPoseSentAt>=32){lastPoseSentAt=_time;send({type:'orientation',quat:lastQuat})}}
+  if(_time-lastRenderAt>=200){lastRenderAt=_time;renderStatus()}session?.requestAnimationFrame(onFrame);
+}
+$('start').onclick=()=>startSensors().catch(e=>message(e.message,false));
+$('calibrate').onclick=()=>send({type:'calibrate'});
+$('sync').onclick=()=>{desiredSync=!serverStatus.sync_enabled;resumePending=false;send({type:'sync',enabled:desiredSync})};
+$('reset').onclick=()=>send({type:'reset'});
+$('mode').onchange=e=>send({type:'mode',mode:e.target.value});
+connect();
+document.addEventListener('visibilitychange',()=>{if(document.hidden){message('页面进入后台，Android 可能暂停 XR/WebSocket')}else{message('页面已回到前台，正在检查连接');if(ws?.readyState!==WebSocket.OPEN)connect();else if(Date.now()-lastPongAt>6000)ws.close(4001,'foreground stale socket')}});
+</script></body></html>

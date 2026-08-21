@@ -1,0 +1,33 @@
+policy_type: act
+pretrained_name_or_path: /home/jing/allprojects/robo_project/lerobot_project/lerobot_joyand/outputs/train/act_so101_test/checkpoints/025000/pretrained_model
+actions_per_chunk: 50
+task: Grab and Place the wooden stick
+server_address: 127.0.0.1:18080
+policy_device: cuda
+chunk_size_threshold: 0.5
+fps: 30
+aggregate_fn_name: weighted_average
+debug_visualize_queue_size: false
+
+robot:
+  type: so101_follower
+  id: myfollower01
+  port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B8E116716-if00
+  disable_torque_on_disconnect: true
+  max_relative_target: 10.0
+  use_degrees: false
+  cameras:
+    wrist:
+      type: opencv
+      index_or_path: /dev/v4l/by-path/pci-0000:03:00.3-usb-0:1:1.0-video-index0
+      width: 640
+      height: 480
+      fps: 30
+      fourcc: YUYV
+    front:
+      type: opencv
+      index_or_path: /dev/v4l/by-path/pci-0000:03:00.3-usb-0:2.1:1.0-video-index0
+      width: 640
+      height: 480
+      fps: 30
+      fourcc: YUYV

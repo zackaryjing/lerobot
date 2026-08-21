@@ -1,0 +1,100 @@
+lerobot-calibrate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=myfollower01
+
+
+
+
+lerobot-calibrate \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=myleader01
+
+
+https://tcnppips4y7o.feishu.cn/wiki/BuCow3dCWiAAI0kStxjcYddlncc
+
+lerobot-teleoperate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=myfollower01 \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=myleader01
+
+
+
+lerobot-teleoperate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM1 \
+    --robot.id=myfollower01 \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM0 \
+    --teleop.id=myleader01
+
+python examples/phone_to_so101/teleoperate.py
+
+python experiments/phone_pose_viz/server.py
+
+
+PYTHONPATH=src /home/jing/miniconda3/envs/lerobot/bin/python \
+    experiments/phone_orientation_control/server.py
+
+
+PYTHONPATH=src /home/jing/miniconda3/envs/lerobot/bin/python \
+  experiments/phone_orientation_control/server.py \
+  --hardware \
+  --port /dev/ttyACM0 \
+  --robot-id myfollower01
+
+PYTHONPATH=src /home/jing/miniconda3/envs/lerobot/bin/python \
+    experiments/phone_orientation_control/server.py
+
+
+    --dataset.repo_id=${HF_USER}/so101_test \  # VVVVV 
+
+lerobot-record \
+    --robot.disable_torque_on_disconnect=true \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=myfollower01 \
+    --robot.cameras="{'wrist': {'type':'opencv', 'index_or_path':0, 'width':640, 'height':480, 'fps':30, 'fourcc':'YUYV'}, 'front': {'type':'opencv', 'index_or_path':4, 'width':640, 'height':480, 'fps':30, 'fourcc':'YUYV'}}" \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=myleader01 \
+    --display_data=true \
+    --dataset.repo_id=local/so101_offical_03 \
+    --dataset.push_to_hub=false \
+    --dataset.num_episodes=10 --dataset.episode_time_s=60 \
+    --dataset.single_task="Grab and Place the wooden stick"
+
+
+
+
+lerobot-record \
+    --resume=true \
+    --robot.disable_torque_on_disconnect=true \
+    --robot.type=so101_follower \
+    --robot.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B8E116716-if00 \
+    --robot.id=myfollower01 \
+    --robot.cameras="{'wrist': {'type':'opencv', 'index_or_path':'/dev/v4l/by-path/pci-0000:03:00.3-usb-0:1:1.0-video-index0', 'width':640, 'height':480, 'fps':30, 'fourcc':'YUYV'}, 'front': {'type':'opencv', 'index_or_path':'/dev/v4l/by-path/pci-0000:03:00.3-usb-0:2.1:1.0-video-index0', 'width':640, 'height':480, 'fps':30, 'fourcc':'YUYV'}}" \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B79016721-if00 \
+    --teleop.id=myleader01 \
+    --display_data=true \
+    --dataset.repo_id=local/so101_offical_04 \
+    --dataset.push_to_hub=false \
+    --dataset.num_episodes=50 --dataset.episode_time_s=60 \
+    --dataset.single_task="Grab and Place the wooden stick"
+
+
+# set -g mouse on
+setw -g mode-keys vi
+
+set -g status-bg colour236
+set -g status-fg white
+set -g status-left "#[bold]#S #[default]"
+set -g status-right "%Y-%m-%d %H:%M"
+
+bind % split-window -c "#{pane_current_path}"
+bind '"' split-window -c "#{pane_current_path}"

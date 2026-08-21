@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SO101 手机控制数字孪生</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#0b1020;color:#e5e7eb;font:13px ui-monospace,monospace}
+#views{display:grid;grid-template-columns:1fr 1.55fr;width:100%;height:100%;gap:2px;background:#273047}
+.view{position:relative;min-width:0;min-height:0;background:#101625;overflow:hidden}.view canvas{display:block;width:100%;height:100%}
+.title{position:absolute;z-index:2;left:10px;top:10px;padding:7px 10px;border-radius:7px;background:#000a;font-weight:700;pointer-events:none}
+#panel{position:absolute;z-index:4;right:10px;top:10px;width:min(410px,calc(100% - 20px));max-height:45%;overflow:auto;padding:10px 12px;border-radius:8px;background:#000c;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none}
+#atlas-controls{position:absolute;z-index:5;left:calc(40% + 18px);bottom:12px;display:flex;gap:7px;align-items:center;flex-wrap:wrap;max-width:calc(60% - 28px);padding:8px;border-radius:8px;background:#000c}
+select,button{background:#1f2937;color:#e5e7eb;border:1px solid #4b5563;border-radius:6px;padding:7px}button{cursor:pointer}button:hover{background:#374151}
+.ok{color:#4ade80}.bad{color:#f87171}.cyan{color:#22d3ee}.green{color:#4ade80}
+@media(max-width:760px){#views{grid-template-columns:1fr;grid-template-rows:.72fr 1.28fr}#panel{top:auto;bottom:62px;max-height:25%;font-size:11px}#atlas-controls{left:8px;bottom:7px;max-width:calc(100% - 16px);font-size:11px}.title{font-size:11px}}
+</style>
+</head>
+<body>
+<div id="views">
+  <div id="phone-view" class="view"><div class="title">手机姿态（绿色箭头 = 顶部前方）</div></div>
+  <div id="robot-view" class="view"><div class="title">SO101 数字孪生　<span class="green">绿色 = 当前尖端</span>　<span class="cyan">青色 = 目标</span></div></div>
+</div>
+<div id="panel">正在加载数字孪生并连接服务端…</div>
+<div id="atlas-controls"><span>方向目标</span><select id="direction-preset"><option value="live">手机实时目标</option><option value="front">正前方</option><option value="back">正后方</option><option value="down">正下方</option><option value="up">正上方</option><option value="left">左</option><option value="right">右</option></select><select id="atlas-candidate" disabled><option>尚无候选</option></select><button id="preview" disabled>预览图谱候选</button><button id="plan-play">全局规划并播放</button><button id="stop-plan">停止</button><button id="live">返回实时</button></div>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {STLLoader} from 'three/addons/loaders/STLLoader.js';
+
+const panel=document.getElementById('panel');
+const makeRenderer=host=>{const r=new THREE.WebGLRenderer({antialias:true});r.setPixelRatio(Math.min(devicePixelRatio,2));r.outputColorSpace=THREE.SRGBColorSpace;host.appendChild(r.domElement);return r};
+const addLights=scene=>{scene.add(new THREE.HemisphereLight(0xdbeafe,0x172033,2.2));const l=new THREE.DirectionalLight(0xffffff,3);l.position.set(.8,-.5,1.2);scene.add(l)};
+
+// Phone view.
+const phoneHost=document.getElementById('phone-view'),phoneScene=new THREE.Scene();phoneScene.background=new THREE.Color(0x101625);addLights(phoneScene);
+const phoneCamera=new THREE.PerspectiveCamera(45,1,.01,20);phoneCamera.position.set(1.3,.9,1.7);phoneCamera.lookAt(0,0,0);
+const phoneRenderer=makeRenderer(phoneHost),phone=new THREE.Group();phoneScene.add(phone);
+phone.add(new THREE.Mesh(new THREE.BoxGeometry(.42,.78,.055),new THREE.MeshPhongMaterial({color:0x374151})));
+const screen=new THREE.Mesh(new THREE.BoxGeometry(.38,.70,.01),new THREE.MeshPhongMaterial({color:0x2563eb,emissive:0x071a44}));screen.position.z=.034;phone.add(screen);
+const topMark=new THREE.Mesh(new THREE.BoxGeometry(.18,.025,.012),new THREE.MeshBasicMaterial({color:0x93c5fd}));topMark.position.set(0,.33,.041);phone.add(topMark);
+phone.add(new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(),.62,0x4ade80,.12,.07));
+phoneScene.add(new THREE.AxesHelper(.6));
+
+// Robot view uses URDF Z-up coordinates directly.
+const robotHost=document.getElementById('robot-view'),robotScene=new THREE.Scene();robotScene.background=new THREE.Color(0x101625);addLights(robotScene);
+const robotCamera=new THREE.PerspectiveCamera(45,1,.005,10);robotCamera.up.set(0,0,1);robotCamera.position.set(.72,-.72,.55);
+const robotRenderer=makeRenderer(robotHost);const controls=new OrbitControls(robotCamera,robotRenderer.domElement);controls.target.set(.12,0,.18);controls.enableDamping=true;
+const grid=new THREE.GridHelper(1.2,24,0x496080,0x273047);grid.rotation.x=Math.PI/2;robotScene.add(grid);robotScene.add(new THREE.AxesHelper(.18));
+const achievedArrow=new THREE.ArrowHelper(new THREE.Vector3(1,0,0),new THREE.Vector3(),.14,0x4ade80,.035,.018);robotScene.add(achievedArrow);
+const targetArrow=new THREE.ArrowHelper(new THREE.Vector3(1,0,0),new THREE.Vector3(),.18,0x22d3ee,.04,.021);robotScene.add(targetArrow);
+const atlasGroup=new THREE.Group();atlasGroup.position.set(-.20,.20,.35);robotScene.add(atlasGroup);
+
+const joints=new Map(),links=new Map();let robotLoaded=false,lastStatus={},atlasData=null,previewCandidate=null,planResult='';
+const nums=(value,fallback='0 0 0')=>(value||fallback).trim().split(/\s+/).map(Number);
+function directChildren(element,name){return [...element.children].filter(child=>child.tagName===name)}
+function applyOrigin(object,origin){if(!origin)return;const [x,y,z]=nums(origin.getAttribute('xyz'));const [r,p,yaw]=nums(origin.getAttribute('rpy'));object.position.set(x,y,z);object.rotation.set(r,p,yaw,'ZYX')}
+
+async function loadRobot(){
+  const urdfUrl=new URL('/robot/so101.urdf',location.href);const xmlText=await (await fetch(urdfUrl,{cache:'no-store'})).text();
+  const xml=new DOMParser().parseFromString(xmlText,'application/xml');const loader=new STLLoader();const meshJobs=[];
+  for(const [index,linkXml] of [...xml.querySelectorAll('robot > link')].entries()){
+    const link=new THREE.Group();link.name=linkXml.getAttribute('name');links.set(link.name,link);
+    for(const visual of directChildren(linkXml,'visual')){
+      const visualGroup=new THREE.Group();applyOrigin(visualGroup,directChildren(visual,'origin')[0]);link.add(visualGroup);
+      const meshXml=visual.querySelector('geometry > mesh');if(!meshXml)continue;
+      const filename=meshXml.getAttribute('filename');const meshUrl=new URL(filename,urdfUrl);meshUrl.searchParams.set('v','real-meshes-1');
+      meshJobs.push(loader.loadAsync(meshUrl.href).then(geometry=>{
+        geometry.computeVertexNormals();const hue=(index*0.083+0.56)%1;const material=new THREE.MeshPhongMaterial({color:new THREE.Color().setHSL(hue,.38,.55),shininess:35});
+        const mesh=new THREE.Mesh(geometry,material);const scale=nums(meshXml.getAttribute('scale'),'1 1 1');mesh.scale.set(...scale);visualGroup.add(mesh);
+      }));
+    }
+  }
+  const childNames=new Set();
+  for(const jointXml of xml.querySelectorAll('robot > joint')){
+    const name=jointXml.getAttribute('name'),type=jointXml.getAttribute('type');const parentName=jointXml.querySelector('parent').getAttribute('link'),childName=jointXml.querySelector('child').getAttribute('link');
+    const originGroup=new THREE.Group(),motionGroup=new THREE.Group();applyOrigin(originGroup,directChildren(jointXml,'origin')[0]);originGroup.add(motionGroup);motionGroup.add(links.get(childName));links.get(parentName).add(originGroup);childNames.add(childName);
+    const axis=new THREE.Vector3(...nums(jointXml.querySelector('axis')?.getAttribute('xyz'),'1 0 0')).normalize();joints.set(name,{type,axis,motionGroup});
+  }
+  const rootName=[...links.keys()].find(name=>!childNames.has(name));robotScene.add(links.get(rootName));
+  await Promise.all(meshJobs);robotLoaded=true;applyStatus(lastStatus);
+}
+
+function setJointValues(values){
+  for(const [name,value] of Object.entries(values||{})){const joint=joints.get(name);if(joint&&joint.type!=='fixed')joint.motionGroup.quaternion.setFromAxisAngle(joint.axis,THREE.MathUtils.degToRad(value))}
+  robotScene.updateMatrixWorld(true);
+}
+function applyStatus(s){
+  lastStatus=s;if(!robotLoaded)return;if(!previewCandidate)setJointValues(s.joints_deg);
+  const tip=links.get('gripper_frame_link'),origin=new THREE.Vector3();tip?.getWorldPosition(origin);achievedArrow.position.copy(origin);targetArrow.position.copy(origin);
+  const achieved=s.current_tip_direction;if(achieved)achievedArrow.setDirection(new THREE.Vector3(...achieved).normalize());
+  else if(tip){const q=new THREE.Quaternion();tip.getWorldQuaternion(q);achievedArrow.setDirection(new THREE.Vector3(0,0,1).applyQuaternion(q).normalize())}
+  if(s.target_tip_direction){targetArrow.visible=true;targetArrow.setDirection(new THREE.Vector3(...s.target_tip_direction).normalize())}else targetArrow.visible=false;
+}
+
+const presets={front:[1,0,0],back:[-1,0,0],down:[0,0,-1],up:[0,0,1],left:[0,1,0],right:[0,-1,0]};
+function targetForPreset(){const key=document.getElementById('direction-preset').value;if(key==='live')return lastStatus.target_tip_direction||[1,0,0];return presets[key]}
+function updateCandidateList(){
+  const select=document.getElementById('atlas-candidate'),target=targetForPreset();select.innerHTML='';if(!atlasData||!target){select.disabled=true;return}
+  const t=new THREE.Vector3(...target).normalize(),rows=[];for(const bin of atlasData.bins)for(const candidate of bin.candidates){const d=new THREE.Vector3(...candidate.direction);rows.push({candidate,error:THREE.MathUtils.radToDeg(Math.acos(THREE.MathUtils.clamp(d.dot(t),-1,1)))})}
+  rows.sort((a,b)=>a.error-b.error);for(const [index,row] of rows.slice(0,12).entries()){const option=document.createElement('option');option.value=index;option.textContent=`#${index+1} 误差 ${row.error.toFixed(2)}° 高度 ${row.candidate.tip_position_m[2].toFixed(3)}m 余量 ${row.candidate.joint_margin.toFixed(2)}`;option._candidate=row.candidate;select.appendChild(option)}
+  select.disabled=!rows.length;document.getElementById('preview').disabled=!rows.length;
+}
+async function loadAtlas(){
+  atlasData=await (await fetch('/atlas',{cache:'no-store'})).json();const positions=[],colors=[];
+  for(const bin of atlasData.bins){positions.push(...bin.center.map(v=>v*.105));const fullness=bin.candidates.length/(atlasData.config.candidates_per_bin||1);const color=new THREE.Color().setHSL(.58-.28*fullness,.85,.55);colors.push(color.r,color.g,color.b)}
+  const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));geometry.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));atlasGroup.add(new THREE.Points(geometry,new THREE.PointsMaterial({size:.008,vertexColors:true,sizeAttenuation:true})));
+  atlasGroup.add(new THREE.AxesHelper(.14));updateCandidateList();
+}
+document.getElementById('direction-preset').onchange=()=>{previewCandidate=null;updateCandidateList();applyStatus(lastStatus)};
+document.getElementById('preview').onclick=()=>{const select=document.getElementById('atlas-candidate'),option=select.options[select.selectedIndex];previewCandidate=option?option._candidate:null;if(previewCandidate){const values={};atlasData.joint_names.forEach((name,i)=>values[name]=previewCandidate.joints_deg[i]);values.gripper=lastStatus.joints_deg?.gripper||0;setJointValues(values);targetArrow.visible=true;targetArrow.setDirection(new THREE.Vector3(...targetForPreset()).normalize());applyStatus(lastStatus)}};
+document.getElementById('plan-play').onclick=async()=>{const button=document.getElementById('plan-play');button.disabled=true;previewCandidate=null;planResult='正在搜索多个 IK 分支和无碰撞路径…';try{const response=await fetch('/sim/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({direction:targetForPreset(),execute:true})});const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);planResult=`规划: ${data.method}, ${data.waypoints_deg.length} 路点, 长度 ${data.normalized_length.toFixed(3)}, ${data.planning_time_s.toFixed(3)}s, 末端误差 ${data.goal.direction_error_deg.toFixed(3)}°`}catch(error){planResult=`规划失败: ${error.message}`}finally{button.disabled=false}};
+document.getElementById('stop-plan').onclick=async()=>{await fetch('/sim/cancel',{method:'POST'});planResult='已停止路径播放';previewCandidate=null;applyStatus(lastStatus)};
+document.getElementById('live').onclick=()=>{previewCandidate=null;document.getElementById('direction-preset').value='live';updateCandidateList();applyStatus(lastStatus)};
+
+let ws,reconnects=0;
+function connect(){
+  ws=new WebSocket(`wss://${location.host}/viz-ws`);
+  ws.onmessage=e=>{const s=JSON.parse(e.data);applyStatus(s);const q=s.phone_quat;if(q)phone.quaternion.set(q[0],q[1],q[2],q[3]);const ast=atlasData?.stats;const path=s.sim_path_active?`${s.sim_waypoint+1}/${s.sim_waypoint_count}`:'idle';panel.innerHTML=`<span class="${s.phone_fresh?'ok':'bad'}">● ${s.phone_fresh?'phone fresh':'phone stale'}</span>　${s.hardware?'HARDWARE':'DRY-RUN'}${previewCandidate?'　<span class="cyan">ATLAS PREVIEW</span>':''}\nURDF: ${robotLoaded?'loaded':'loading'}　WS reconnects: ${reconnects}\natlas: ${ast?`${ast.occupied_bins}/${ast.total_bins} bins, ${ast.retained_candidates} candidates`:'loading'}\nbackend: ${s.tracking_backend||'-'}　global path: ${path}　${s.status||''}\n${planResult}\ncalibrated: ${s.calibrated}　sync: ${s.sync_enabled}　mode: ${s.mode}\ntip error: ${s.tip_error_deg??'-'}°\nrejects: ${s.reject_count}　${s.last_rejection||'-'}\nplanned: ${JSON.stringify(s.planned_joints_deg||s.joints_deg||{})}\nmeasured: ${JSON.stringify(s.measured_joints_deg||{})}`;if(document.getElementById('direction-preset').value==='live'&&!previewCandidate)updateCandidateList()};
+  ws.onclose=()=>{reconnects++;panel.textContent='可视化连接断开，正在重试…';setTimeout(connect,1000)};
+}
+
+function resize(host,camera,renderer){const w=host.clientWidth,h=host.clientHeight;if(renderer.domElement.width!==w||renderer.domElement.height!==h){renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix()}}
+function animate(){requestAnimationFrame(animate);resize(phoneHost,phoneCamera,phoneRenderer);resize(robotHost,robotCamera,robotRenderer);controls.update();phoneRenderer.render(phoneScene,phoneCamera);robotRenderer.render(robotScene,robotCamera)}
+Promise.all([loadRobot(),loadAtlas()]).catch(error=>{panel.textContent=`数字孪生资源加载失败: ${error.stack||error}`});connect();animate();
+</script>
+</body></html>

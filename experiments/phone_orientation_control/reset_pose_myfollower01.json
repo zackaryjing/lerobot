@@ -1,0 +1,19 @@
+{
+  "description": "Folded reset pose adjusted 7 degrees at elbow_flex to clear modeled self-collision",
+  "joints_deg": {
+    "shoulder_pan": 7.824175824175824,
+    "shoulder_lift": -103.86813186813187,
+    "elbow_flex": 89.83516483516483,
+    "wrist_flex": 66.76923076923077,
+    "wrist_roll": -1.978021978021978,
+    "gripper": 1.5678254942058625
+  },
+  "raw_encoder": {
+    "shoulder_pan": 2071,
+    "shoulder_lift": 825,
+    "elbow_flex": 3009,
+    "wrist_flex": 2803,
+    "wrist_roll": 1997,
+    "gripper": 2031
+  }
+}

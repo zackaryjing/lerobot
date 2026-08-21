@@ -1,0 +1,17 @@
+[
+  ["base_link", "upper_arm_link"],
+  ["base_link", "lower_arm_link"],
+  ["base_link", "wrist_link"],
+  ["base_link", "gripper_link"],
+  ["base_link", "moving_jaw_so101_v1_link"],
+  ["shoulder_link", "lower_arm_link"],
+  ["shoulder_link", "wrist_link"],
+  ["shoulder_link", "gripper_link"],
+  ["shoulder_link", "moving_jaw_so101_v1_link"],
+  ["upper_arm_link", "wrist_link"],
+  ["upper_arm_link", "gripper_link"],
+  ["upper_arm_link", "moving_jaw_so101_v1_link"],
+  ["lower_arm_link", "gripper_link"],
+  ["lower_arm_link", "moving_jaw_so101_v1_link"],
+  ["wrist_link", "moving_jaw_so101_v1_link"]
+]
