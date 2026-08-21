@@ -18,6 +18,10 @@
 
 
 import logging
+import os
+import sys
+import threading
+import time
 import traceback
 from contextlib import nullcontext
 from copy import copy
@@ -115,6 +119,87 @@ def predict_action(
     return action
 
 
+class _TerminalKeyboardListener:
+    """Read LeRobot recording shortcuts directly from a POSIX terminal."""
+
+    def __init__(self, on_key):
+        import termios
+
+        self._on_key = on_key
+        self._fd = sys.stdin.fileno()
+        self._termios = termios
+        self._old_settings = None
+        self._restore_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="lerobot-terminal-keyboard", daemon=True)
+
+    def start(self):
+        import tty
+
+        self._old_settings = self._termios.tcgetattr(self._fd)
+        # cbreak disables line buffering and echo while keeping Ctrl+C as SIGINT.
+        tty.setcbreak(self._fd)
+        self._thread.start()
+        return self
+
+    def _restore_terminal(self):
+        with self._restore_lock:
+            if self._old_settings is not None:
+                settings, self._old_settings = self._old_settings, None
+                self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, settings)
+
+    def _run(self):
+        import select
+
+        buffer = b""
+        escape_started_at = None
+        try:
+            while not self._stop_event.is_set():
+                readable, _, _ = select.select([self._fd], [], [], 0.02)
+                if readable:
+                    data = os.read(self._fd, 32)
+                    if data:
+                        buffer += data
+                        if buffer.startswith(b"\x1b") and escape_started_at is None:
+                            escape_started_at = time.monotonic()
+
+                while buffer:
+                    if buffer.startswith(b"\x1b[C"):
+                        self._on_key("right")
+                        buffer = buffer[3:]
+                        escape_started_at = time.monotonic() if buffer.startswith(b"\x1b") else None
+                    elif buffer.startswith(b"\x1b[D"):
+                        self._on_key("left")
+                        buffer = buffer[3:]
+                        escape_started_at = time.monotonic() if buffer.startswith(b"\x1b") else None
+                    elif buffer.startswith(b"\x1b"):
+                        # Wait briefly to distinguish a standalone Escape key from an arrow sequence.
+                        if escape_started_at is None:
+                            escape_started_at = time.monotonic()
+                        if len(buffer) < 3 and time.monotonic() - escape_started_at < 0.15:
+                            break
+                        if buffer == b"\x1b":
+                            self._on_key("esc")
+                            buffer = b""
+                        else:
+                            # Ignore unsupported terminal escape sequences (for example up/down arrows).
+                            buffer = buffer[3:]
+                        escape_started_at = time.monotonic() if buffer.startswith(b"\x1b") else None
+                    else:
+                        # Recording control only uses arrows and Escape; discard other terminal input.
+                        buffer = buffer[1:]
+        except Exception:
+            logging.exception("Terminal keyboard listener stopped unexpectedly.")
+        finally:
+            self._restore_terminal()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        self._restore_terminal()
+
+
 def init_keyboard_listener():
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
@@ -136,6 +221,26 @@ def init_keyboard_listener():
     events["rerecord_episode"] = False
     events["stop_recording"] = False
 
+    def handle_key(key_name: str):
+        if key_name == "right":
+            print("Right arrow key pressed. Exiting loop...")
+            events["exit_early"] = True
+        elif key_name == "left":
+            print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+            events["rerecord_episode"] = True
+            events["exit_early"] = True
+        elif key_name == "esc":
+            print("Escape key pressed. Stopping data recording...")
+            events["stop_recording"] = True
+            events["exit_early"] = True
+
+    # Wayland blocks pynput's global keyboard hook. Read escape sequences from the
+    # focused terminal instead, which also avoids printing literals such as "^[[C".
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" and sys.stdin.isatty():
+        listener = _TerminalKeyboardListener(handle_key).start()
+        logging.info("Using terminal keyboard controls for the Wayland session (focus this terminal).")
+        return listener, events
+
     if is_headless():
         logging.warning(
             "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
@@ -149,16 +254,11 @@ def init_keyboard_listener():
     def on_press(key):
         try:
             if key == keyboard.Key.right:
-                print("Right arrow key pressed. Exiting loop...")
-                events["exit_early"] = True
+                handle_key("right")
             elif key == keyboard.Key.left:
-                print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
-                events["rerecord_episode"] = True
-                events["exit_early"] = True
+                handle_key("left")
             elif key == keyboard.Key.esc:
-                print("Escape key pressed. Stopping data recording...")
-                events["stop_recording"] = True
-                events["exit_early"] = True
+                handle_key("esc")
         except Exception as e:
             print(f"Error handling key press: {e}")
 
