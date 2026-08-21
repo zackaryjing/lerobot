@@ -56,6 +56,10 @@ class SimPlanRequest(BaseModel):
     execute: bool = True
 
 
+class EscapeTriggerRequest(BaseModel):
+    direction: list[float] | None = None
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     task = asyncio.create_task(status_broadcaster())
@@ -147,13 +151,37 @@ async def cancel_simulation():
     return {"ok": ok, "message": message}
 
 
+@app.post("/escape/trigger")
+async def trigger_escape(request: EscapeTriggerRequest):
+    """Manually start a direction-preserving escape (digital-twin test hook)."""
+    if controller is None:
+        raise HTTPException(status_code=503, detail="controller is not available")
+    ok, message = controller.trigger_escape(request.direction)
+    if not ok:
+        raise HTTPException(status_code=409, detail=message)
+    return {"ok": True, "message": message}
+
+
+@app.post("/escape/cancel")
+async def cancel_escape():
+    if controller is None:
+        raise HTTPException(status_code=503, detail="controller is not available")
+    ok, message = controller.cancel_escape()
+    return {"ok": ok, "message": message}
+
+
 @app.websocket("/viz-ws")
 async def visualization_websocket(ws: WebSocket):
     """Read-only visualization stream; it never invalidates phone calibration."""
     await ws.accept()
+    sent_escape_generation = -1
     try:
         while True:
             await ws.send_json({"type": "status", **controller.status()})
+            payload = controller.escape_path_payload()
+            if payload is not None and payload[0] != sent_escape_generation:
+                sent_escape_generation, escape_message = payload
+                await ws.send_json(escape_message)
             await asyncio.sleep(1.0 / 30.0)
     except (WebSocketDisconnect, RuntimeError):
         pass
@@ -268,6 +296,7 @@ def local_ip() -> str:
 def make_controller(
     args: argparse.Namespace,
     state_validator=None,
+    escape_planner=None,
 ) -> OrientationController:
     config = ControlConfig()
     limits = load_joint_limits(args.urdf, args.calibration)
@@ -305,6 +334,7 @@ def make_controller(
         hard_joint_limits=hard_limits,
         reset_joints=reset_joints,
         state_validator=state_validator,
+        escape_planner=escape_planner,
     )
     try:
         instance.start()
@@ -335,6 +365,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_MANUAL_SAMPLES,
         help="optional teleoperated direction samples; ignored when the file does not exist",
+    )
+    parser.add_argument(
+        "--no-escape",
+        action="store_true",
+        help="disable the direction-preserving escape/reconfiguration planner",
     )
     return parser.parse_args()
 
@@ -376,7 +411,23 @@ def main() -> None:
     def validate_tracking_target(joints):
         return tracking_validator.evaluate(joints)[0] is not None
 
-    controller = make_controller(args, state_validator=validate_tracking_target)
+    # The escape planner owns this validator exclusively (its own placo stack),
+    # so background planning never contends with /sim/plan or the control loop.
+    # Constraint strictness matches tracking: no floor envelopes, because escape
+    # is part of tracking and its waypoints are re-validated by the controller.
+    from escape_planner import EscapePlanner
+
+    escape_validator = SO101StateValidator(
+        args.urdf,
+        args.collisions,
+        limits,
+        min_tip_height_m=-math.inf,
+        min_moving_frame_height_m=-math.inf,
+    )
+    escape_planner = None if args.no_escape else EscapePlanner(escape_validator)
+    controller = make_controller(
+        args, state_validator=validate_tracking_target, escape_planner=escape_planner
+    )
     if args.hardware:
         global_planner = None
     else:

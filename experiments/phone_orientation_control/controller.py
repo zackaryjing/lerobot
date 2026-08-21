@@ -166,6 +166,140 @@ def vector_slerp(a: np.ndarray, b: np.ndarray, fraction: float) -> np.ndarray:
     )
 
 
+def bounded_damped_least_squares(
+    jacobian: np.ndarray,
+    error: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    damping: float,
+) -> np.ndarray:
+    count = jacobian.shape[1]
+    delta = np.zeros(count, dtype=float)
+    free = list(range(count))
+    fixed: list[int] = []
+    while free:
+        residual = error.copy()
+        if fixed:
+            residual -= jacobian[:, fixed] @ delta[fixed]
+        free_jacobian = jacobian[:, free]
+        delta[free] = free_jacobian.T @ np.linalg.solve(
+            free_jacobian @ free_jacobian.T + damping * damping * np.eye(3),
+            residual,
+        )
+        violations: list[tuple[float, int, float]] = []
+        for index in free:
+            if delta[index] < lower[index]:
+                violations.append((lower[index] - delta[index], index, lower[index]))
+            elif delta[index] > upper[index]:
+                violations.append((delta[index] - upper[index], index, upper[index]))
+        if not violations:
+            break
+        _, index, bound = max(violations)
+        delta[index] = bound
+        free.remove(index)
+        fixed.append(index)
+    return np.clip(delta, lower, upper)
+
+
+def direction_tip_step(
+    fk: Callable[[np.ndarray], np.ndarray],
+    current: np.ndarray,
+    desired_direction: np.ndarray,
+    *,
+    lower_delta_rad: np.ndarray,
+    upper_delta_rad: np.ndarray,
+    damping: float,
+    jacobian_epsilon_deg: float,
+    max_step_rad: float,
+    accept_tolerance_rad: float = math.radians(0.25),
+    fractions: tuple[float, ...] = (1.0, 0.75, 0.5, 0.25, 0.125, 0.0625),
+    valid: Callable[[np.ndarray], bool] | None = None,
+    edge_valid: Callable[[np.ndarray, np.ndarray], bool] | None = None,
+    bias_rad: np.ndarray | None = None,
+    bias_weight: float = 0.0,
+) -> tuple[np.ndarray, str]:
+    """One bounded differential-IK step tracking only the visual gripper-tip axis.
+
+    Shared verbatim by the live tracker and the escape planner so both agree on
+    what "a step toward the target direction" means. Roll around the tip axis is
+    free. ``valid`` gates a candidate configuration; ``edge_valid`` gates the
+    straight joint-space segment from ``current``; ``None`` accepts everything.
+    ``bias_rad`` optionally adds a null-space posture drift (weighted by
+    ``bias_weight``) so repeated projections spread across branches instead of
+    collapsing into one basin; the task step itself stays untouched.
+    """
+    current = np.asarray(current, dtype=float)
+    current_rotation = fk(current)[:3, :3]
+    current_direction = gripper_tip_in_robot(current_rotation)
+    desired_direction = normalize_vector(desired_direction)
+    cross = np.cross(current_direction, desired_direction)
+    cross_norm = float(np.linalg.norm(cross))
+    dot = float(np.clip(np.dot(current_direction, desired_direction), -1.0, 1.0))
+    if cross_norm < 1e-8:
+        helper = (
+            np.array([1.0, 0.0, 0.0])
+            if abs(current_direction[0]) < 0.9
+            else np.array([0.0, 1.0, 0.0])
+        )
+        error = (
+            np.zeros(3)
+            if dot > 0.0
+            else normalize_vector(np.cross(current_direction, helper)) * math.pi
+        )
+    else:
+        error = cross * (math.atan2(cross_norm, dot) / cross_norm)
+    error_norm = float(np.linalg.norm(error))
+    if error_norm > max_step_rad:
+        error *= max_step_rad / error_norm
+    epsilon_rad = math.radians(jacobian_epsilon_deg)
+    jacobian = np.zeros((3, len(current)), dtype=float)
+    for i in range(len(current)):
+        perturbed = current.copy()
+        perturbed[i] += jacobian_epsilon_deg
+        perturbed_rotation = fk(perturbed)[:3, :3]
+        delta = rotation_vector_from_matrix(perturbed_rotation @ current_rotation.T)
+        jacobian[:, i] = delta / epsilon_rad
+
+    # Rotation around the tip itself has no visible effect and must not
+    # cause wrist-roll motion. Remove that unobservable component.
+    direction_projection = np.eye(3) - np.outer(current_direction, current_direction)
+    jacobian = direction_projection @ jacobian
+    delta_rad = bounded_damped_least_squares(jacobian, error, lower_delta_rad, upper_delta_rad, damping)
+    if bias_rad is not None and bias_weight > 0.0:
+        # Task-consistent posture drift: project the bias into the Jacobian's
+        # null space so it cannot fight the tracking error, then re-clip.
+        pseudo_inverse = jacobian.T @ np.linalg.solve(
+            jacobian @ jacobian.T + damping * damping * np.eye(3), np.eye(3)
+        )
+        null_projection = np.eye(len(current)) - pseudo_inverse @ jacobian
+        delta_rad = np.clip(
+            delta_rad + bias_weight * (null_projection @ np.asarray(bias_rad, dtype=float)),
+            lower_delta_rad,
+            upper_delta_rad,
+        )
+    raw_solution = current + np.rad2deg(delta_rad)
+
+    if raw_solution.shape != current.shape or not np.all(np.isfinite(raw_solution)):
+        return current.copy(), "ik_non_finite: differential IK returned non-finite joint values"
+
+    def accepted(candidate: np.ndarray) -> bool:
+        if valid is not None and not valid(candidate):
+            return False
+        return edge_valid is None or edge_valid(current, candidate)
+
+    before_error = vector_angle(current_direction, desired_direction)
+    for fraction in fractions:
+        solution = current + fraction * (raw_solution - current)
+        if not accepted(solution):
+            continue
+        reached_direction = gripper_tip_in_robot(fk(solution)[:3, :3])
+        after_error = vector_angle(reached_direction, desired_direction)
+        if after_error <= before_error + accept_tolerance_rad:
+            return solution, ""
+
+    return current.copy(), "collision_or_limits: no valid orientation step"
+
+
 def load_joint_limits(urdf_path: Path, calibration_path: Path) -> dict[str, tuple[float, float]]:
     """Load the exact LeRobot calibration range without an artificial margin."""
     del urdf_path  # Kept in the signature for existing experiment scripts.
@@ -206,6 +340,18 @@ class ControlConfig:
     jacobian_epsilon_deg: float = 0.15
     differential_ik_damping: float = 0.08
     max_orientation_ik_step_rad: float = math.radians(3.0)
+    # Escape (direction-preserving reconfiguration) tuning.
+    escape_enabled: bool = True
+    trap_tick_threshold: int = 15
+    trap_stall_error_rad: float = math.radians(0.15)
+    trap_min_error_rad: float = math.radians(0.5)
+    trap_target_move_rad: float = math.radians(1.5)
+    escape_cooldown_s: float = 6.0
+    escape_waypoint_delta_deg: float = 2.0
+    escape_target_drift_abort_rad: float = math.radians(12.0)
+    escape_planning_timeout_s: float = 12.0
+    escape_loop_window_s: float = 60.0
+    escape_loop_limit: int = 3
 
 
 @dataclass
@@ -214,6 +360,18 @@ class DirectionPlan:
     target_direction: np.ndarray
     started_at: float
     duration_s: float
+
+
+class EscapePlannerLike(Protocol):
+    """Structural type for the direction-preserving reconfiguration planner."""
+
+    def plan(
+        self,
+        start_joints_deg: np.ndarray,
+        target_direction: np.ndarray,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> Any | None: ...
 
 
 class OrientationController:
@@ -229,6 +387,7 @@ class OrientationController:
         hard_joint_limits: dict[str, tuple[float, float]] | None = None,
         reset_joints: np.ndarray | None = None,
         state_validator: Callable[[np.ndarray], bool] | None = None,
+        escape_planner: EscapePlannerLike | None = None,
     ) -> None:
         self.kinematics = kinematics
         self.joint_limits = joint_limits
@@ -237,6 +396,7 @@ class OrientationController:
         self.config = config or ControlConfig()
         self.hardware = robot is not None
         self._state_validator = state_validator
+        self._escape_planner = escape_planner
         self._lock = threading.Lock()
         self._kinematics_lock = threading.RLock()
         self._validation_lock = threading.RLock()
@@ -266,6 +426,23 @@ class OrientationController:
         self._current_tip_direction: np.ndarray | None = None
         self._target_tip_direction: np.ndarray | None = None
         self._tip_position_m: np.ndarray | None = None
+        # Escape state machine: idle -> planning -> executing -> completed/failed.
+        self._escape_state: str = "idle"
+        self._escape_plan_q: list[np.ndarray] | None = None
+        self._escape_index = 0
+        self._escape_direction: np.ndarray | None = None
+        self._escape_generation = 0
+        self._escape_thread: threading.Thread | None = None
+        self._escape_cancel = threading.Event()
+        self._escape_trap_ticks = 0
+        self._escape_anchor_direction: np.ndarray | None = None
+        self._escape_prev_error_rad: float | None = None
+        self._escape_next_allowed_time = -math.inf
+        self._escape_started_monotonic = 0.0
+        self._escape_last_reason = ""
+        self._escape_outcome_counts: dict[str, int] = {}
+        self._escape_history: list[tuple[float, np.ndarray]] = []
+        self._escape_path_payload: tuple[int, dict[str, Any]] | None = None
         initial_joints = (
             dry_initial_joints
             if dry_initial_joints is not None
@@ -309,6 +486,7 @@ class OrientationController:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._escape_cancel.set()
         if self._thread:
             self._thread.join(timeout=2.0)
         if self.hardware and self.robot.is_connected:
@@ -404,6 +582,8 @@ class OrientationController:
                 return False, "phone orientation is stale"
             if enabled and self._sim_trajectory is not None:
                 return False, "joint path is still moving to its target"
+            if not enabled and self._escape_state != "idle":
+                self._cancel_escape_locked("sync disabled")
             self._sync_enabled = enabled
             self._plan = None
             if enabled:
@@ -416,6 +596,8 @@ class OrientationController:
     def invalidate_calibration(self) -> None:
         """Require fresh phone calibration without interrupting a joint path."""
         with self._lock:
+            if self._escape_state != "idle":
+                self._cancel_escape_locked("calibration invalidated")
             self._calibrated = False
             self._sync_enabled = False
             self._latest_phone_quat = None
@@ -444,6 +626,8 @@ class OrientationController:
 
     def request_reset(self) -> tuple[bool, str]:
         with self._lock:
+            if self._escape_state != "idle":
+                self._cancel_escape_locked("reset requested")
             self._sync_enabled = False
             self._plan = None
             path = self._valid_path_suffix(self._q[:5], self._startup_q[:5])
@@ -494,6 +678,364 @@ class OrientationController:
 
     def global_path_execution_allowed(self) -> bool:
         return True
+
+    # -------------------------------------------------------------- escape
+    # Direction-preserving reconfiguration: when the local tracker stalls
+    # against limits, plan a path through the direction manifold to a better
+    # conditioned configuration, play it back, then resume tracking.
+
+    def trigger_escape(self, direction: Any = None) -> tuple[bool, str]:
+        """Manually request an escape (digital-twin test hook).
+
+        Requires calibration and synchronization, because the escape plays back
+        inside the tracking loop. With ``direction`` given, the planner freezes
+        exactly that target; otherwise the current filtered phone direction is
+        frozen. Manual requests bypass cooldown and the stall threshold but still
+        refuse while another escape is active.
+        """
+        target = None
+        if direction is not None:
+            try:
+                target = normalize_vector(np.asarray(direction, dtype=float))
+            except ValueError as exc:
+                return False, f"invalid escape direction: {exc}"
+        spawn_args = None
+        with self._lock:
+            if not self._calibrated:
+                return False, "calibration is required first"
+            if not self._sync_enabled:
+                return False, "synchronization is required for escape playback"
+            if self._escape_state in ("planning", "executing"):
+                return False, f"escape is {self._escape_state}"
+            # A finished/failed escape may be re-triggered manually immediately;
+            # only automatic triggering honors the cooldown.
+            if target is None:
+                target = self._live_target_direction_locked()
+                if target is None:
+                    return False, "no phone-derived target direction is available yet"
+            spawn_args = self._begin_escape_locked(target)
+        if spawn_args is not None:
+            threading.Thread(
+                target=self._escape_worker, args=spawn_args, name="escape-planner", daemon=True
+            ).start()
+        return True, "escape planning started"
+
+    def cancel_escape(self) -> tuple[bool, str]:
+        with self._lock:
+            active = self._escape_state != "idle"
+            self._cancel_escape_locked("cancelled by request")
+            if active:
+                self._last_status = "escape cancelled; holding position"
+        return True, ("escape cancelled" if active else "no active escape")
+
+    def escape_path_payload(self) -> tuple[int, dict[str, Any]] | None:
+        """Latest successfully planned escape for the digital twin, if any."""
+        with self._lock:
+            if self._escape_path_payload is None:
+                return None
+            generation, payload = self._escape_path_payload
+            return generation, dict(payload)
+
+    def _live_target_direction_locked(self) -> np.ndarray | None:
+        mapping = self._phone_to_robot_rotation
+        filtered = self._filtered_phone_quat
+        if mapping is None or filtered is None:
+            return None
+        return phone_forward_in_robot(mapping, quat_to_matrix(filtered))
+
+    def _reset_trap_locked(self) -> None:
+        self._escape_trap_ticks = 0
+        self._escape_anchor_direction = None
+        self._escape_prev_error_rad = None
+
+    def _register_stall_locked(self) -> tuple | None:
+        """Count one stalled tick unless the phone target moved past the window."""
+        live_target = self._live_target_direction_locked()
+        if live_target is None:
+            self._reset_trap_locked()
+            return None
+        if self._escape_anchor_direction is None:
+            self._escape_anchor_direction = live_target.copy()
+        elif vector_angle(live_target, self._escape_anchor_direction) > self.config.trap_target_move_rad:
+            # Deliberate fast phone motion legitimately saturates joints; only a
+            # stable target counts toward the trap threshold.
+            self._escape_anchor_direction = live_target.copy()
+            self._reset_trap_locked()
+            return None
+        self._escape_trap_ticks += 1
+        return self._maybe_trigger_escape_locked()
+
+    def _note_tracking_failure(self) -> tuple | None:
+        """Record a rejected IK tick; returns escape worker spawn args if triggered."""
+        with self._lock:
+            if self._escape_state != "idle":
+                return None
+            return self._register_stall_locked()
+
+    def _note_tracking_success(self, achieved_error_rad: float) -> tuple | None:
+        """Record a sent IK tick; stalls (no error improvement) also count."""
+        with self._lock:
+            prev = self._escape_prev_error_rad
+            self._escape_prev_error_rad = achieved_error_rad
+            if self._escape_state != "idle":
+                return None
+            if achieved_error_rad < self.config.trap_min_error_rad:
+                self._reset_trap_locked()
+                return None
+            stalled = prev is not None and (prev - achieved_error_rad) < self.config.trap_stall_error_rad
+            if not stalled:
+                self._escape_trap_ticks = 0
+                return None
+            return self._register_stall_locked()
+
+    def _maybe_trigger_escape_locked(self) -> tuple | None:
+        cfg = self.config
+        if not cfg.escape_enabled or self._escape_planner is None:
+            return None
+        if self._escape_state != "idle":
+            return None
+        if not self._calibrated or not self._sync_enabled:
+            return None
+        if self._sim_trajectory is not None:
+            return None
+        now = time.monotonic()
+        if now - self._latest_phone_time > cfg.phone_stale_timeout_s:
+            return None
+        if now < self._escape_next_allowed_time:
+            return None
+        if self._escape_trap_ticks < cfg.trap_tick_threshold:
+            return None
+        target = self._live_target_direction_locked()
+        if target is None:
+            return None
+        return self._begin_escape_locked(target)
+
+    def _begin_escape_locked(self, direction: np.ndarray) -> tuple | None:
+        """Freeze the target and switch to planning; returns worker spawn args."""
+        self._escape_generation += 1
+        self._escape_state = "planning"
+        self._escape_plan_q = None
+        self._escape_index = 0
+        self._escape_direction = np.asarray(direction, dtype=float).copy()
+        self._escape_started_monotonic = time.monotonic()
+        self._escape_cancel = threading.Event()
+        self._plan = None  # smooth-mode slerp restarts cleanly after the escape
+        self._reset_trap_locked()
+        self._last_error = ""
+        self._last_status = "escape planning; holding last command"
+        return (
+            self._q[:5].copy(),
+            self._escape_direction.copy(),
+            self._escape_generation,
+            self.config.escape_planning_timeout_s,
+        )
+
+    def _escape_worker(self, start_q: np.ndarray, direction: np.ndarray, generation: int, timeout_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        try:
+            plan_obj = self._escape_planner.plan(
+                start_q,
+                direction,
+                cancel_event=self._escape_cancel,
+                deadline=deadline,
+            )
+        except Exception as exc:  # noqa: BLE001 - worker must never crash silently
+            logger.exception("escape planning failed")
+            plan_obj = None
+            with self._lock:
+                self._publish_escape_plan_locked(None, generation, reason=f"planner error: {exc}")
+            return
+        with self._lock:
+            self._publish_escape_plan_locked(plan_obj, generation)
+
+    def _publish_escape_plan_locked(self, plan_obj: Any, generation: int, reason: str | None = None) -> None:
+        """Validate and adopt (or reject) a finished plan. Caller holds ``_lock``."""
+        if generation != self._escape_generation or self._escape_state != "planning":
+            return  # stale worker result after cancel/re-trigger
+        if not self._calibrated or not self._sync_enabled:
+            self._cancel_escape_locked("tracking stopped during planning")
+            return
+        if plan_obj is None:
+            self._finish_escape_terminal_locked("failed", reason or "no manifold path within budget")
+            return
+
+        waypoints = [np.asarray(item, dtype=float) for item in plan_obj.waypoints_deg]
+        invalid_index = next(
+            (
+                index
+                for index, item in enumerate(waypoints)
+                if item.shape != (5,) or not np.all(np.isfinite(item)) or not self._target_valid(item)
+            ),
+            None,
+        )
+        if invalid_index is not None:
+            self._finish_escape_terminal_locked(
+                "failed", f"planner waypoint {invalid_index} rejected by runtime validation"
+            )
+            return
+        bad_edge = next(
+            (
+                first
+                for first, (a_edge, b_edge) in enumerate(zip(waypoints, waypoints[1:]))
+                if not self._edge_valid(a_edge, b_edge)
+            ),
+            None,
+        )
+        if bad_edge is not None:
+            self._finish_escape_terminal_locked(
+                "failed", f"planner segment {bad_edge} rejected by runtime validation"
+            )
+            return
+
+        dense = self._resample_escape(waypoints)
+        bridge = self._valid_path_suffix(self._q[:5], dense[0])
+        if bridge is None:
+            self._finish_escape_terminal_locked("failed", "bridge from current pose to escape path is invalid")
+            return
+        chain = [item.copy() for item in bridge + dense]
+        deduped = [chain[0]]
+        for item in chain[1:]:
+            if not np.allclose(item, deduped[-1], atol=1e-9):
+                deduped.append(item)
+
+        self._escape_plan_q = deduped
+        self._escape_index = 0
+        self._escape_state = "executing"
+        self._escape_last_reason = getattr(plan_obj, "method", "planned")
+        self._last_error = ""
+        self._last_status = f"escape executing ({len(deduped)} waypoints)"
+        self._escape_path_payload = (
+            generation,
+            {
+                "type": "escape_path",
+                "waypoints_deg": [[float(v) for v in item] for item in deduped],
+                "target_direction": self._escape_direction.tolist(),
+                "method": self._escape_last_reason,
+                "joint_names": ARM_JOINTS,
+            },
+        )
+        logger.info("escape plan adopted: %s", self._escape_last_reason)
+
+    def _resample_escape(self, waypoints: list[np.ndarray]) -> list[np.ndarray]:
+        result = [waypoints[0].copy()]
+        for first, second in zip(waypoints, waypoints[1:]):
+            segment = float(np.max(np.abs(second - first)))
+            pieces = max(1, int(math.ceil(segment / self.config.escape_waypoint_delta_deg)))
+            for piece in range(1, pieces + 1):
+                result.append(first + (second - first) * (piece / pieces))
+        return result
+
+    def _tick_escape_execution(self, q: np.ndarray) -> None:
+        with self._lock:
+            plan_q = self._escape_plan_q
+            index = self._escape_index
+            frozen = None if self._escape_direction is None else self._escape_direction.copy()
+        if plan_q is None or frozen is None:
+            return
+        while index < len(plan_q) and np.allclose(plan_q[index], q[:5], atol=1e-8):
+            index += 1
+        if index >= len(plan_q):
+            with self._lock:
+                self._finish_escape_terminal_locked("completed", "completed")
+            self._update_tip_state(q[:5])
+            return
+        live_target = self._live_target_direction_locked_safe()
+        if (
+            live_target is not None
+            and vector_angle(live_target, frozen) > self.config.escape_target_drift_abort_rad
+        ):
+            # The user redirected the phone mid-escape; holding the old manifold
+            # is pointless. Stop within one <=2-degree waypoint.
+            with self._lock:
+                self._cancel_escape_locked("target moved during escape", terminal=True)
+            self._update_tip_state(q[:5])
+            return
+        command = q.copy()
+        command[:5] = plan_q[index]
+        sent = self._send(command)
+        self._update_tip_state(sent[:5])
+        with self._lock:
+            self._escape_index = index + 1
+            self._target_tip_direction = frozen.copy()
+            self._last_error = ""
+            self._last_status = f"escape executing ({index + 1}/{len(plan_q)})"
+
+    def _live_target_direction_locked_safe(self) -> np.ndarray | None:
+        with self._lock:
+            return self._live_target_direction_locked()
+
+    def _housekeep_escape(self, now: float) -> None:
+        with self._lock:
+            state = self._escape_state
+            if state == "failed" or state == "completed":
+                if now >= self._escape_next_allowed_time:
+                    self._escape_state = "idle"
+                return
+            if math.isinf(self._escape_next_allowed_time):
+                # Escape-loop latch: re-arm once the user asks for a clearly
+                # different direction than the looped one.
+                history = self._escape_history
+                live_target = self._live_target_direction_locked()
+                if history and live_target is not None:
+                    last_direction = history[-1][1]
+                    if vector_angle(live_target, last_direction) > math.radians(2.0):
+                        self._escape_next_allowed_time = now
+
+    def _finish_escape_terminal_locked(self, outcome: str, reason: str) -> None:
+        self._escape_state = outcome
+        self._escape_last_reason = reason
+        self._arm_cooldown_locked()
+        self._record_escape_outcome_locked(outcome)
+        if outcome == "completed":
+            self._plan = None
+            self._last_status = "escape completed; resuming tracking"
+            logger.info("escape completed")
+        elif outcome == "aborted":
+            self._last_status = f"escape aborted ({reason}); resuming tracking"
+            logger.warning("escape aborted: %s", reason)
+        else:
+            self._last_status = f"escape failed ({reason}); holding position"
+            logger.warning("escape failed: %s", reason)
+        self._escape_plan_q = None
+        self._escape_index = 0
+
+    def _cancel_escape_locked(self, reason: str, terminal: bool = False) -> None:
+        """Invalidate any active/planned escape; stale workers publish nothing."""
+        self._escape_generation += 1
+        self._escape_cancel.set()
+        self._escape_plan_q = None
+        self._escape_index = 0
+        self._escape_direction = None
+        if terminal:
+            self._escape_state = "failed"
+            self._escape_last_reason = reason
+            self._arm_cooldown_locked()
+            self._record_escape_outcome_locked("aborted")
+        else:
+            self._escape_state = "idle"
+            self._escape_last_reason = reason
+
+    def _arm_cooldown_locked(self) -> None:
+        self._escape_next_allowed_time = time.monotonic() + self.config.escape_cooldown_s
+
+    def _record_escape_outcome_locked(self, outcome: str) -> None:
+        self._escape_outcome_counts[outcome] = self._escape_outcome_counts.get(outcome, 0) + 1
+        now = time.monotonic()
+        if self._escape_direction is not None:
+            self._escape_history.append((now, self._escape_direction.copy()))
+        cutoff = now - self.config.escape_loop_window_s
+        self._escape_history = [entry for entry in self._escape_history if entry[0] >= cutoff]
+        if not self._escape_history:
+            return
+        reference = self._escape_history[0][1]
+        recent_same = sum(
+            1
+            for _, direction in self._escape_history
+            if vector_angle(direction, reference) <= math.radians(2.0)
+        )
+        if recent_same >= self.config.escape_loop_limit:
+            # Latch until the operator intervenes or asks for another direction.
+            self._escape_next_allowed_time = math.inf
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -560,6 +1102,23 @@ class OrientationController:
                 "last_rejection": self._last_rejection,
                 "last_error": self._last_error,
                 "status": self._last_status,
+                "escape_enabled": self.config.escape_enabled and self._escape_planner is not None,
+                "escape_state": self._escape_state,
+                "escape_last_reason": self._escape_last_reason,
+                "escape_progress": {
+                    "index": self._escape_index,
+                    "count": 0 if self._escape_plan_q is None else len(self._escape_plan_q),
+                },
+                "escape_planning_elapsed_s": (
+                    None
+                    if self._escape_state != "planning"
+                    else round(max(0.0, time.monotonic() - self._escape_started_monotonic), 1)
+                ),
+                "escape_trap_ticks": self._escape_trap_ticks,
+                "escape_outcome_counts": dict(self._escape_outcome_counts),
+                "escape_frozen_direction": (
+                    None if self._escape_direction is None else self._escape_direction.tolist()
+                ),
             }
 
     def _run(self) -> None:
@@ -600,6 +1159,7 @@ class OrientationController:
             mode = self._mode
             sim_trajectory = self._sim_trajectory
             sim_waypoint_index = self._sim_waypoint_index
+            escape_state = self._escape_state
 
         if sim_trajectory is not None:
             self._tick_simulated_trajectory(q, sim_trajectory, sim_waypoint_index)
@@ -619,12 +1179,26 @@ class OrientationController:
                 self._last_error = "phone orientation is stale"
                 self._last_status = "holding position; waiting for fresh phone data"
             return
+
+        # The filter keeps running in every branch so tracking resumes without a
+        # quaternion jump after an escape finishes.
         if filtered_q is None:
             filtered_q = latest_q
         alpha_phone = 1.0 - math.exp(-dt / self.config.phone_filter_tau_s)
         filtered_q = quat_slerp(filtered_q, latest_q, alpha_phone)
         with self._lock:
             self._filtered_phone_quat = filtered_q
+
+        if escape_state == "executing":
+            self._tick_escape_execution(q)
+            return
+        if escape_state == "planning":
+            with self._lock:
+                elapsed = max(0.0, now - self._escape_started_monotonic)
+                self._last_error = ""
+                self._last_status = f"escape planning ({elapsed:.1f}s); holding last command"
+            return
+        self._housekeep_escape(now)
         target_direction = phone_forward_in_robot(mapping, quat_to_matrix(filtered_q))
         with self._kinematics_lock:
             current_pose = self.kinematics.forward_kinematics(q[:5])
@@ -657,6 +1231,11 @@ class OrientationController:
                 self._last_status = "holding last finite command"
                 if self._reject_count <= 5 or self._reject_count % 30 == 0:
                     logger.warning("Rejected IK target #%d: %s", self._reject_count, reason)
+            spawn_args = self._note_tracking_failure()
+            if spawn_args is not None:
+                threading.Thread(
+                    target=self._escape_worker, args=spawn_args, name="escape-planner", daemon=True
+                ).start()
             return
 
         command = q.copy()
@@ -664,8 +1243,19 @@ class OrientationController:
         sent = self._send(command)
         self._update_tip_state(sent[:5])
         with self._lock:
+            achieved = (
+                None
+                if self._current_tip_direction is None
+                else self._current_tip_direction.copy()
+            )
             self._last_error = ""
             self._last_status = f"tracking ({mode}) via LeRobot action"
+        if achieved is not None:
+            spawn_args = self._note_tracking_success(vector_angle(achieved, desired_direction))
+            if spawn_args is not None:
+                threading.Thread(
+                    target=self._escape_worker, args=spawn_args, name="escape-planner", daemon=True
+                ).start()
 
     def _update_tip_state(self, joints_deg: np.ndarray) -> None:
         with self._kinematics_lock:
@@ -741,70 +1331,19 @@ class OrientationController:
     ) -> tuple[np.ndarray, str]:
         """Track only the visual gripper-tip axis; roll around it is free."""
         with self._kinematics_lock:
-            current_pose = self.kinematics.forward_kinematics(current)
-            current_rotation = current_pose[:3, :3]
-            current_direction = gripper_tip_in_robot(current_rotation)
-            desired_direction = normalize_vector(desired_direction)
-            cross = np.cross(current_direction, desired_direction)
-            cross_norm = float(np.linalg.norm(cross))
-            dot = float(np.clip(np.dot(current_direction, desired_direction), -1.0, 1.0))
-            if cross_norm < 1e-8:
-                helper = (
-                    np.array([1.0, 0.0, 0.0])
-                    if abs(current_direction[0]) < 0.9
-                    else np.array([0.0, 1.0, 0.0])
-                )
-                error = (
-                    np.zeros(3)
-                    if dot > 0.0
-                    else normalize_vector(np.cross(current_direction, helper)) * math.pi
-                )
-            else:
-                error = cross * (math.atan2(cross_norm, dot) / cross_norm)
-            error_norm = float(np.linalg.norm(error))
-            if error_norm > self.config.max_orientation_ik_step_rad:
-                error *= self.config.max_orientation_ik_step_rad / error_norm
-            epsilon_deg = self.config.jacobian_epsilon_deg
-            epsilon_rad = math.radians(epsilon_deg)
-            jacobian = np.zeros((3, len(ARM_JOINTS)), dtype=float)
-            for i in range(len(ARM_JOINTS)):
-                perturbed = current.copy()
-                perturbed[i] += epsilon_deg
-                perturbed_rotation = self.kinematics.forward_kinematics(perturbed)[:3, :3]
-                delta = rotation_vector_from_matrix(perturbed_rotation @ current_rotation.T)
-                jacobian[:, i] = delta / epsilon_rad
-
-            # Rotation around the tip itself has no visible effect and must not
-            # cause wrist-roll motion. Remove that unobservable component.
-            direction_projection = np.eye(3) - np.outer(current_direction, current_direction)
-            jacobian = direction_projection @ jacobian
-
-            damping = self.config.differential_ik_damping
             lower_delta, upper_delta = self._joint_delta_bounds(current)
-            delta_rad = self._bounded_damped_least_squares(
-                jacobian,
-                error,
-                lower_delta,
-                upper_delta,
-                damping,
+            return direction_tip_step(
+                self.kinematics.forward_kinematics,
+                current,
+                desired_direction,
+                lower_delta_rad=lower_delta,
+                upper_delta_rad=upper_delta,
+                damping=self.config.differential_ik_damping,
+                jacobian_epsilon_deg=self.config.jacobian_epsilon_deg,
+                max_step_rad=self.config.max_orientation_ik_step_rad,
+                valid=self._target_valid,
+                edge_valid=self._edge_valid,
             )
-            raw_solution = current + np.rad2deg(delta_rad)
-
-            if raw_solution.shape != (5,) or not np.all(np.isfinite(raw_solution)):
-                return current, "ik_non_finite: differential IK returned non-finite joint values"
-
-            before_error = vector_angle(current_direction, desired_direction)
-            for fraction in (1.0, 0.75, 0.5, 0.25, 0.125, 0.0625):
-                solution = current + fraction * (raw_solution - current)
-                if not self._target_valid(solution) or not self._edge_valid(current, solution):
-                    continue
-                reached = self.kinematics.forward_kinematics(solution)
-                reached_direction = gripper_tip_in_robot(reached[:3, :3])
-                after_error = vector_angle(reached_direction, desired_direction)
-                if after_error <= before_error + math.radians(0.25):
-                    return solution, ""
-
-        return current, "collision_or_limits: no valid orientation step"
 
     def _joint_delta_bounds(self, current: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         lower = np.array([self.joint_limits[name][0] for name in ARM_JOINTS]) - current
@@ -819,32 +1358,7 @@ class OrientationController:
         upper: np.ndarray,
         damping: float,
     ) -> np.ndarray:
-        count = jacobian.shape[1]
-        delta = np.zeros(count, dtype=float)
-        free = list(range(count))
-        fixed: list[int] = []
-        while free:
-            residual = error.copy()
-            if fixed:
-                residual -= jacobian[:, fixed] @ delta[fixed]
-            free_jacobian = jacobian[:, free]
-            delta[free] = free_jacobian.T @ np.linalg.solve(
-                free_jacobian @ free_jacobian.T + damping * damping * np.eye(3),
-                residual,
-            )
-            violations: list[tuple[float, int, float]] = []
-            for index in free:
-                if delta[index] < lower[index]:
-                    violations.append((lower[index] - delta[index], index, lower[index]))
-                elif delta[index] > upper[index]:
-                    violations.append((delta[index] - upper[index], index, upper[index]))
-            if not violations:
-                break
-            _, index, bound = max(violations)
-            delta[index] = bound
-            free.remove(index)
-            fixed.append(index)
-        return np.clip(delta, lower, upper)
+        return bounded_damped_least_squares(jacobian, error, lower, upper, damping)
 
     def _within_limits(self, joints: np.ndarray) -> bool:
         return all(

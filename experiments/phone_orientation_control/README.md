@@ -45,6 +45,43 @@ The explicit phone/gripper semantic-axis mapping lives in `frame_adapter.py`.
 - The configured reset pose is itself calibration-valid and self-collision-free.
   Reset and hardware startup follow validated joint-space waypoints to it.
 
+## Stall escape (direction-preserving reconfiguration)
+
+Greedy local tracking can saturate joints against calibration limits: two
+directions may be reachable, but only through a joint-space detour that keeps
+the tip pointed at the target. When that happens the controller now plans an
+escape instead of holding forever:
+
+- **Trigger**: after `trap_tick_threshold` (default 15, i.e. 0.5 s) consecutive
+  ticks where the local IK step is rejected or makes no error progress while the
+  phone target stays stable, the current target direction freezes and a planner
+  worker starts. Fast deliberate phone motions reset the counter instead.
+- **Planner** (`escape_planner.py`): constrained sampling on the direction
+  manifold {q valid : tip_dir(q) within a 3° cone of the target}. Random seeds
+  are projected onto the manifold with the same bounded direction-IK step the
+  tracker uses; goals are scored by joint margin and task manipulability; a
+  CBiRRT-Connect-style search connects the start to the best goal with every
+  edge sampled for limits, self-collision, and cone membership. Paths are
+  resampled so no command exceeds `escape_waypoint_delta_deg` (2°) per tick.
+- **Execution**: playback runs *inside* synchronization. Phone updates keep
+  streaming and filtering; if the live target moves more than 12° away from the
+  frozen direction mid-flight, the escape aborts at waypoint granularity and
+  normal tracking resumes toward the new direction.
+- **Guardrails**: planned waypoints are re-validated by the controller's exact
+  runtime checks before execution; failures arm a cooldown (6 s) during which
+  automatic re-triggering is blocked; three escapes toward the same direction
+  within one minute latch the auto-trigger until the operator intervenes or
+  asks for a different direction; calibration invalidation, reset, and sync-off
+  cancel any active escape.
+- **Digital twin**: `/viz` shows the planned path in orange with per-waypoint
+  markers, plus live escape state/progress. The 触发逃逸 button requests a manual
+  escape toward the selected preset direction (manual requests bypass the
+  cooldown but still require calibration and sync); 取消逃逸 cancels. The same
+  endpoints are available as `POST /escape/trigger {direction|null}` and
+  `POST /escape/cancel`. Pass `--no-escape` to disable the feature entirely.
+- Constraint strictness matches tracking (no floor envelopes); the old atlas /
+  global planner remains dry-run only and unchanged.
+
 ## Run without hardware
 
 ```bash

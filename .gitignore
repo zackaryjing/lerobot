@@ -195,3 +195,6 @@ simulation/mujoco_wood_pick/config/appearance.local.json
 
 # Local MuJoCo runtime log written to the repo root.
 MUJOCO_LOG.TXT
+
+# Local HTTPS certificates for the phone/twin servers.
+experiments/phone_pose_viz/

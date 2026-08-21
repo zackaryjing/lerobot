@@ -22,7 +22,7 @@ select,button{background:#1f2937;color:#e5e7eb;border:1px solid #4b5563;border-r
   <div id="robot-view" class="view"><div class="title">SO101 数字孪生　<span class="green">绿色 = 当前尖端</span>　<span class="cyan">青色 = 目标</span></div></div>
 </div>
 <div id="panel">正在加载数字孪生并连接服务端…</div>
-<div id="atlas-controls"><span>方向目标</span><select id="direction-preset"><option value="live">手机实时目标</option><option value="front">正前方</option><option value="back">正后方</option><option value="down">正下方</option><option value="up">正上方</option><option value="left">左</option><option value="right">右</option></select><select id="atlas-candidate" disabled><option>尚无候选</option></select><button id="preview" disabled>预览图谱候选</button><button id="plan-play">全局规划并播放</button><button id="stop-plan">停止</button><button id="live">返回实时</button></div>
+<div id="atlas-controls"><span>方向目标</span><select id="direction-preset"><option value="live">手机实时目标</option><option value="front">正前方</option><option value="back">正后方</option><option value="down">正下方</option><option value="up">正上方</option><option value="left">左</option><option value="right">右</option></select><select id="atlas-candidate" disabled><option>尚无候选</option></select><button id="preview" disabled>预览图谱候选</button><button id="plan-play">全局规划并播放</button><button id="stop-plan">停止</button><button id="live">返回实时</button><button id="trigger-escape" title="保持尖端朝向不变，绕开限位重新配置关节">触发逃逸</button><button id="cancel-escape">取消逃逸</button></div>
 <script type="importmap">
 {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
 </script>
@@ -53,6 +53,26 @@ const grid=new THREE.GridHelper(1.2,24,0x496080,0x273047);grid.rotation.x=Math.P
 const achievedArrow=new THREE.ArrowHelper(new THREE.Vector3(1,0,0),new THREE.Vector3(),.14,0x4ade80,.035,.018);robotScene.add(achievedArrow);
 const targetArrow=new THREE.ArrowHelper(new THREE.Vector3(1,0,0),new THREE.Vector3(),.18,0x22d3ee,.04,.021);robotScene.add(targetArrow);
 const atlasGroup=new THREE.Group();atlasGroup.position.set(-.20,.20,.35);robotScene.add(atlasGroup);
+const escapeGroup=new THREE.Group();robotScene.add(escapeGroup);
+
+// Escape path rendering: replay each waypoint through the joint scene graph,
+// record the gripper tip world position, then restore the live pose.
+function drawEscapePath(message){
+  escapeGroup.clear();
+  const saved=lastStatus.joints_deg,points=[];
+  for(const waypoint of message.waypoints_deg||[]){
+    const values={};(message.joint_names||[]).forEach((name,i)=>values[name]=waypoint[i]);
+    setJointValues(values);
+    const tip=links.get('gripper_frame_link');if(!tip)break;
+    const position=new THREE.Vector3();tip.getWorldPosition(position);points.push(position);
+  }
+  if(saved)setJointValues(saved);
+  if(points.length<2)return;
+  escapeGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(points),new THREE.LineBasicMaterial({color:0xffa500})));
+  const sphere=new THREE.SphereGeometry(.004,8,8),material=new THREE.MeshBasicMaterial({color:0xffa500});
+  for(const position of points){const marker=new THREE.Mesh(sphere,material);marker.position.copy(position);escapeGroup.add(marker)}
+}
+function clearEscapePath(){escapeGroup.clear()}
 
 const joints=new Map(),links=new Map();let robotLoaded=false,lastStatus={},atlasData=null,previewCandidate=null,planResult='';
 const nums=(value,fallback='0 0 0')=>(value||fallback).trim().split(/\s+/).map(Number);
@@ -115,11 +135,19 @@ document.getElementById('preview').onclick=()=>{const select=document.getElement
 document.getElementById('plan-play').onclick=async()=>{const button=document.getElementById('plan-play');button.disabled=true;previewCandidate=null;planResult='正在搜索多个 IK 分支和无碰撞路径…';try{const response=await fetch('/sim/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({direction:targetForPreset(),execute:true})});const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);planResult=`规划: ${data.method}, ${data.waypoints_deg.length} 路点, 长度 ${data.normalized_length.toFixed(3)}, ${data.planning_time_s.toFixed(3)}s, 末端误差 ${data.goal.direction_error_deg.toFixed(3)}°`}catch(error){planResult=`规划失败: ${error.message}`}finally{button.disabled=false}};
 document.getElementById('stop-plan').onclick=async()=>{await fetch('/sim/cancel',{method:'POST'});planResult='已停止路径播放';previewCandidate=null;applyStatus(lastStatus)};
 document.getElementById('live').onclick=()=>{previewCandidate=null;document.getElementById('direction-preset').value='live';updateCandidateList();applyStatus(lastStatus)};
+document.getElementById('trigger-escape').onclick=async()=>{
+  const button=document.getElementById('trigger-escape');button.disabled=true;planResult='逃逸规划中：保持朝向不变，搜索绕行路径…';
+  try{const response=await fetch('/escape/trigger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({direction:targetForPreset()})});
+    const data=await response.json();if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);planResult=`逃逸已触发: ${data.message}`}
+  catch(error){planResult=`逃逸触发失败: ${error.message}`}finally{button.disabled=false}};
+document.getElementById('cancel-escape').onclick=async()=>{await fetch('/escape/cancel',{method:'POST'});planResult='已请求取消逃逸';clearEscapePath();previewCandidate=null;applyStatus(lastStatus)};
 
 let ws,reconnects=0;
 function connect(){
   ws=new WebSocket(`wss://${location.host}/viz-ws`);
-  ws.onmessage=e=>{const s=JSON.parse(e.data);applyStatus(s);const q=s.phone_quat;if(q)phone.quaternion.set(q[0],q[1],q[2],q[3]);const ast=atlasData?.stats;const path=s.sim_path_active?`${s.sim_waypoint+1}/${s.sim_waypoint_count}`:'idle';panel.innerHTML=`<span class="${s.phone_fresh?'ok':'bad'}">● ${s.phone_fresh?'phone fresh':'phone stale'}</span>　${s.hardware?'HARDWARE':'DRY-RUN'}${previewCandidate?'　<span class="cyan">ATLAS PREVIEW</span>':''}\nURDF: ${robotLoaded?'loaded':'loading'}　WS reconnects: ${reconnects}\natlas: ${ast?`${ast.occupied_bins}/${ast.total_bins} bins, ${ast.retained_candidates} candidates`:'loading'}\nbackend: ${s.tracking_backend||'-'}　global path: ${path}　${s.status||''}\n${planResult}\ncalibrated: ${s.calibrated}　sync: ${s.sync_enabled}　mode: ${s.mode}\ntip error: ${s.tip_error_deg??'-'}°\nrejects: ${s.reject_count}　${s.last_rejection||'-'}\nplanned: ${JSON.stringify(s.planned_joints_deg||s.joints_deg||{})}\nmeasured: ${JSON.stringify(s.measured_joints_deg||{})}`;if(document.getElementById('direction-preset').value==='live'&&!previewCandidate)updateCandidateList()};
+  ws.onmessage=e=>{const m=JSON.parse(e.data);
+    if(m.type==='escape_path'){drawEscapePath(m);planResult=`逃逸路径已加载: ${m.method}, ${m.waypoints_deg.length} 路点`;return}
+    const s=m;applyStatus(s);const q=s.phone_quat;if(q)phone.quaternion.set(q[0],q[1],q[2],q[3]);const ast=atlasData?.stats;const path=s.sim_path_active?`${s.sim_waypoint+1}/${s.sim_waypoint_count}`:'idle';const escapeProgress=s.escape_progress?`${s.escape_progress.index}/${s.escape_progress.count}`:'-/-';panel.innerHTML=`<span class="${s.phone_fresh?'ok':'bad'}">● ${s.phone_fresh?'phone fresh':'phone stale'}</span>　${s.hardware?'HARDWARE':'DRY-RUN'}${previewCandidate?'　<span class="cyan">ATLAS PREVIEW</span>':''}\nURDF: ${robotLoaded?'loaded':'loading'}　WS reconnects: ${reconnects}\natlas: ${ast?`${ast.occupied_bins}/${ast.total_bins} bins, ${ast.retained_candidates} candidates`:'loading'}\nbackend: ${s.tracking_backend||'-'}　global path: ${path}　${s.status||''}\n<span class="${s.escape_state==='failed'?'bad':s.escape_state==='executing'?'ok':''}">escape: ${s.escape_state||'-'} ${escapeProgress} ${s.escape_last_reason||''}</span>　stall: ${s.escape_trap_ticks??0}　outcomes: ${JSON.stringify(s.escape_outcome_counts||{})}\n${planResult}\ncalibrated: ${s.calibrated}　sync: ${s.sync_enabled}　mode: ${s.mode}\ntip error: ${s.tip_error_deg??'-'}°\nrejects: ${s.reject_count}　${s.last_rejection||'-'}\nplanned: ${JSON.stringify(s.planned_joints_deg||s.joints_deg||{})}\nmeasured: ${JSON.stringify(s.measured_joints_deg||{})}`;if(document.getElementById('direction-preset').value==='live'&&!previewCandidate)updateCandidateList()};
   ws.onclose=()=>{reconnects++;panel.textContent='可视化连接断开，正在重试…';setTimeout(connect,1000)};
 }
 

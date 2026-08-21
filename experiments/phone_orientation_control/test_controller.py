@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 
 import json
+import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +23,7 @@ from controller import (
     vector_angle,
     load_joint_limits,
 )
+from escape_planner import EscapePlanner, EscapePlannerConfig
 from frame_adapter import GRIPPER_TIP_LOCAL, PHONE_FORWARD_LOCAL
 from direction_atlas import AtlasConfig, DirectionAtlasBuilder, SO101StateValidator, fibonacci_sphere
 from global_planner import GlobalDirectionPlanner, GlobalPlannerConfig
@@ -566,3 +569,411 @@ def test_phone_sync_uses_local_ik_without_global_path_playback():
     assert not status["sim_path_active"]
     assert not status["global_planning"]
     assert status["tracking_backend"] == "local_ik_lerobot_action"
+
+
+# --------------------------------------------------------------------------
+# Direction-preserving escape planner
+# --------------------------------------------------------------------------
+
+FOLDED = np.array([7.824, -103.868, 89.835, 66.769, -1.978])
+# Joint-safe step from the folded pose: shoulder_lift has only ~0.75 degrees of
+# negative headroom against the real calibration, so it must move positive.
+ESC_DELTA = np.array([2.0, 0.6, 1.5, -2.0, 2.0])
+
+
+def _make_escape_planner(**overrides):
+    calibration = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower/myfollower01.json"
+    limits = load_joint_limits(ROOT / "SO101/so101_new_calib.urdf", calibration)
+    validator = SO101StateValidator(
+        ROOT / "SO101/so101_new_calib.urdf",
+        ROOT / "SO101/collisions.json",
+        limits,
+        min_tip_height_m=-np.inf,
+        min_moving_frame_height_m=-np.inf,
+    )
+    return EscapePlanner(validator, EscapePlannerConfig(**overrides)), validator, limits
+
+
+class FakeEscapePlanner:
+    """Deterministic planner stub returning a fixed waypoint list."""
+
+    def __init__(self, waypoints_deg, method="direct"):
+        self.waypoints_deg = waypoints_deg
+        self.method = method
+        self.calls = []
+
+    def plan(self, start_joints_deg, target_direction, cancel_event=None, deadline=None):
+        self.calls.append((np.asarray(start_joints_deg).copy(), np.asarray(target_direction).copy()))
+        return SimpleNamespace(
+            waypoints_deg=[list(map(float, waypoint)) for waypoint in self.waypoints_deg],
+            target_direction=list(map(float, target_direction)),
+            goal=SimpleNamespace(direction_error_deg=0.0),
+            method=self.method,
+            planning_time_s=0.0,
+            tree_nodes=0,
+            projections=0,
+        )
+
+
+class FailingEscapePlanner:
+    def plan(self, start_joints_deg, target_direction, cancel_event=None, deadline=None):
+        return None
+
+
+def _escape_controller(planner, robot=None, **config_overrides):
+    calibration = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower/myfollower01.json"
+    config = ControlConfig(**config_overrides)
+    limits = load_joint_limits(ROOT / "SO101/so101_new_calib.urdf", calibration)
+    hard_limits = load_calibration_limits(calibration)
+    kinematics = RobotKinematics(str(ROOT / "SO101/so101_new_calib.urdf"), joint_names=ARM_JOINTS)
+    controller = OrientationController(
+        kinematics,
+        limits,
+        robot=robot,
+        config=config,
+        hard_joint_limits=hard_limits,
+        dry_initial_joints=np.array([*FOLDED, 1.568]),
+        escape_planner=planner,
+    )
+    controller.submit_phone_orientation([0.0, 0.0, 0.0, 1.0])
+    assert controller.calibrate()[0]
+    assert controller.set_sync(True)[0]
+    return controller
+
+
+def test_escape_planner_projects_perturbed_configs_into_direction_cone():
+    planner, validator, limits = _make_escape_planner()
+    base = np.array([0.0, 30.0, -60.0, -30.0, 0.0])
+    direction = planner.tip_direction(base)
+    rng = np.random.default_rng(7)
+
+    checked = 0
+    valid = 0
+    for _ in range(8):
+        perturbed = np.clip(base + rng.uniform(-8.0, 8.0, size=5), [limits[n][0] for n in ARM_JOINTS],
+                            [limits[n][1] for n in ARM_JOINTS])
+        projected = planner.project(perturbed, direction)
+        if projected is None:
+            continue
+        checked += 1
+        assert planner.direction_error_deg(projected, direction) <= math.degrees(
+            EscapePlannerConfig().direction_tolerance_rad
+        )
+        if validator.evaluate(projected)[0] is not None:
+            valid += 1
+    assert checked >= 5, "projection failed to converge from most seeds"
+    assert valid >= max(1, checked - 2), "too many projected configs landed invalid"
+
+
+def test_escape_planner_finds_separated_goals_for_one_direction():
+    planner, _, _ = _make_escape_planner(goal_samples=60, goal_candidates=4)
+    start = FOLDED.copy()
+    direction = planner.tip_direction(start)
+
+    goals = planner._generate_goals(start, direction)
+
+    assert len(goals) >= 2
+    normalized = [planner._normalized(goal) for goal in goals]
+    for first in range(len(normalized)):
+        for second in range(first + 1, len(normalized)):
+            separation = float(np.linalg.norm(normalized[first] - normalized[second]))
+            assert separation >= planner.config.goal_separation_normalized - 1e-9
+
+
+def test_escape_planner_connects_same_direction_branches_with_valid_path():
+    planner, validator, _ = _make_escape_planner(
+        goal_samples=40, goal_candidates=3, rrt_max_iterations=300, planning_timeout_s=6.0
+    )
+    # Two distinct configurations that point the same way exercise the
+    # constrained search; the straight joint-space line between distant
+    # branches usually violates the cone or collision checks.
+    pairs = [
+        (FOLDED.copy(), np.array([0.0, 30.0, -60.0, -30.0, 0.0])),
+        (np.array([40.0, -20.0, 40.0, -50.0, 10.0]), FOLDED.copy()),
+    ]
+    planned = None
+    for start, goal_config in pairs:
+        direction = planner.tip_direction(goal_config)
+        plan_obj = planner.plan(start, direction)
+        if plan_obj is None:
+            continue
+        waypoints = [np.asarray(w, dtype=float) for w in plan_obj.waypoints_deg]
+        # The plan starts ON the manifold (never at the off-cone trapped pose);
+        # the hop from the trapped pose is the controller's collision-only
+        # bridge, so it must exist but is exempt from the cone.
+        assert validator.evaluate(waypoints[0])[0] is not None
+        assert planner.direction_error_deg(waypoints[0], direction) <= math.degrees(
+            planner.config.direction_tolerance_rad
+        )
+        assert planner._edge_valid_manifold(start, waypoints[0], direction, check_cone=False), "no bridge"
+        assert all(validator.evaluate(w)[0] is not None for w in waypoints), "invalid waypoint"
+        for waypoint in waypoints:
+            error = vector_angle(planner.tip_direction(waypoint), direction)
+            assert error <= planner.config.direction_tolerance_rad + 1e-6, "cone violated"
+        deltas = [float(np.max(np.abs(b - a))) for a, b in zip(waypoints, waypoints[1:])]
+        assert max(deltas) <= planner.config.waypoint_delta_deg + 1e-9
+        planned = plan_obj
+        break
+    assert planned is not None, "planner failed to connect same-direction branches"
+
+
+def test_escape_edge_validation_rejects_cone_violation_and_accepts_safe_pair():
+    planner, _, _ = _make_escape_planner()
+    base = np.array([0.0, 30.0, -60.0, -30.0, 0.0])
+    direction = planner.tip_direction(base)
+    nearby = planner.project(base + np.array([2.0, -2.0, 1.0, 1.0, -1.0]), direction)
+    assert nearby is not None
+
+    far = np.clip(base + np.array([70.0, 0.0, 0.0, 0.0, 0.0]), [-104, -104, -97, -104, -160], [104, 104, 97, 104, 160])
+    assert planner._edge_valid_manifold(base, nearby, direction)
+    assert not planner._edge_valid_manifold(base, far, direction)
+
+
+def test_escape_waypoints_are_resampled_to_max_joint_delta():
+    planner, _, _ = _make_escape_planner()
+    segment = [np.zeros(5), np.array([45.0, -30.0, 20.0, -15.0, 10.0])]
+    resampled = planner._resample(segment)
+
+    assert np.allclose(resampled[0], segment[0])
+    deltas = [float(np.max(np.abs(b - a))) for a, b in zip(resampled, resampled[1:])]
+    assert max(deltas) <= planner.config.waypoint_delta_deg + 1e-9
+    assert np.allclose(resampled[-1], segment[-1])
+
+
+def test_trap_detection_triggers_escape_after_threshold():
+    fake = FakeEscapePlanner([[*FOLDED], [*FOLDED + ESC_DELTA]])
+    controller = _escape_controller(fake)
+    assert controller.status()["escape_state"] == "idle"
+
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = controller._note_tracking_failure()
+        if spawn_args is not None:
+            break
+
+    assert spawn_args is not None, "escape did not trigger after threshold"
+    assert controller.status()["escape_state"] == "planning"
+    assert controller.status()["sync_enabled"]
+    controller._escape_worker(*spawn_args)  # synchronous publish
+    assert controller.status()["escape_state"] == "executing"
+    assert fake.calls, "planner was never invoked"
+    frozen = controller.status()["escape_frozen_direction"]
+    assert frozen is not None and np.allclose(frozen, fake.calls[0][1], atol=1e-9)
+
+
+def test_escape_execution_completes_and_resumes_tracking():
+    delta = ESC_DELTA
+    fake = FakeEscapePlanner([[*FOLDED], [*(FOLDED + delta)]])
+    # Short cooldown keeps the simulated tick loop small while still proving
+    # the completed -> idle housekeeping transition.
+    controller = _escape_controller(fake, escape_cooldown_s=0.5)
+    config = controller.config
+
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = controller._note_tracking_failure()
+        if spawn_args is not None:
+            break
+    assert spawn_args is not None
+    controller._escape_worker(*spawn_args)  # synchronous publish
+    assert controller.status()["escape_state"] == "executing"
+    assert controller.status()["escape_progress"]["count"] >= 2
+
+    joints_at_completion = None
+    now = controller._last_tick
+    for _ in range(int(config.escape_cooldown_s * config.fps) + 10):
+        now += 1.0 / config.fps
+        controller._latest_phone_time = now
+        controller._tick(now)
+        status = controller.status()
+        if status["escape_state"] == "completed" and joints_at_completion is None:
+            joints_at_completion = controller.current_arm_joints()[:5].copy()
+        if status["escape_state"] == "idle":
+            break
+
+    assert controller.status()["escape_state"] == "idle"
+    assert controller.status()["sync_enabled"]
+    assert controller.status()["escape_outcome_counts"].get("completed", 0) == 1
+    assert joints_at_completion is not None
+    assert not np.allclose(controller.current_arm_joints()[:5], joints_at_completion), (
+        "tracking did not resume after the escape finished"
+    )
+
+
+def test_escape_cancelled_by_calibration_invalidation_or_sync_off():
+    for cancel in ("calibration", "sync"):
+        delta = ESC_DELTA
+        fake = FakeEscapePlanner([[*FOLDED], [*(FOLDED + delta)]])
+        controller = _escape_controller(fake)
+        spawn_args = None
+        for _ in range(controller.config.trap_tick_threshold):
+            spawn_args = controller._note_tracking_failure()
+            if spawn_args is not None:
+                break
+        controller._escape_worker(*spawn_args)
+        assert controller.status()["escape_state"] == "executing"
+
+        if cancel == "calibration":
+            controller.invalidate_calibration()
+        else:
+            controller.set_sync(False)
+        assert controller.status()["escape_state"] == "idle"
+        assert np.allclose(controller.current_arm_joints()[:5], FOLDED, atol=1e-9)
+
+
+def test_escape_target_drift_aborts_execution():
+    delta = ESC_DELTA
+    fake = FakeEscapePlanner([[*FOLDED], [*(FOLDED + delta)], [*(FOLDED + 2 * delta)]])
+    controller = _escape_controller(fake)
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = controller._note_tracking_failure()
+        if spawn_args is not None:
+            break
+    controller._escape_worker(*spawn_args)
+    assert controller.status()["escape_state"] == "executing"
+
+    # Rotate the phone mapping so the live target leaves the frozen direction.
+    angle = np.deg2rad(60.0)
+    rotation_z = np.array(
+        [[np.cos(angle), -np.sin(angle), 0.0], [np.sin(angle), np.cos(angle), 0.0], [0.0, 0.0, 1.0]]
+    )
+    with controller._lock:
+        controller._phone_to_robot_rotation = rotation_z @ controller._phone_to_robot_rotation
+    now = controller._last_tick + 1.0 / controller.config.fps
+    controller._latest_phone_time = now
+    controller._tick(now)
+
+    assert controller.status()["escape_state"] == "failed"
+    assert "target moved" in controller.status()["escape_last_reason"]
+    assert controller.status()["escape_outcome_counts"].get("aborted", 0) == 1
+
+
+def test_escape_trigger_guards_cooldown_and_manual_bypass():
+    failing = FailingEscapePlanner()
+    controller = _escape_controller(failing)
+    direction = [1.0, 0.0, 0.0]
+
+    uncalibrated = OrientationController(
+        RobotKinematics(str(ROOT / "SO101/so101_new_calib.urdf"), joint_names=ARM_JOINTS),
+        load_joint_limits(ROOT / "SO101/so101_new_calib.urdf",
+                          Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower/myfollower01.json"),
+        escape_planner=failing,
+    )
+    ok, message = uncalibrated.trigger_escape(direction)
+    assert not ok and "calibration" in message
+
+    unsynced = _escape_controller(failing)
+    with unsynced._lock:
+        unsynced._sync_enabled = False
+    ok, message = unsynced.trigger_escape(direction)
+    assert not ok and "synchronization" in message
+
+    # While planning: refuse a second request (state forced deterministically
+    # because the stub planner finishes faster than the test can re-request).
+    ok, message = controller.trigger_escape(direction)
+    assert ok, message
+    controller.cancel_escape()
+    with controller._lock:
+        controller._escape_state = "planning"
+        controller._escape_generation += 1
+    ok, message = controller.trigger_escape(direction)
+    assert not ok and "planning" in message
+    with controller._lock:
+        controller._escape_state = "idle"
+
+    # A failing plan arms the cooldown...
+    ok, message = controller.trigger_escape(direction)
+    assert ok, message
+    controller._escape_worker(
+        controller._q[:5].copy(), np.asarray(direction, dtype=float), controller._escape_generation, 1.0
+    )
+    assert controller.status()["escape_state"] == "failed"
+    # ...which blocks automatic re-triggering but not an explicit manual one.
+    with controller._lock:
+        controller._escape_trap_ticks = controller.config.trap_tick_threshold
+        auto = controller._maybe_trigger_escape_locked()
+    assert auto is None
+    ok, message = controller.trigger_escape(direction)
+    assert ok, message  # manual requests bypass the cooldown latch
+    controller.cancel_escape()
+
+
+def test_escape_publish_revalidates_waypoints_and_bridges_from_live_commanded_q():
+    # A plan starting away from the commanded pose gets bridged from _q.
+    delta = 1.5 * ESC_DELTA
+    fake = FakeEscapePlanner([[*(FOLDED + delta)], [*(FOLDED + 1.5 * delta)]])
+    controller = _escape_controller(fake)
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = controller._note_tracking_failure()
+        if spawn_args is not None:
+            break
+    controller._escape_worker(*spawn_args)
+
+    assert controller.status()["escape_state"] == "executing"
+    plan_q = controller._escape_plan_q
+    assert np.allclose(plan_q[0][:5], controller.current_arm_joints()[:5])
+    assert np.allclose(plan_q[-1][:5], FOLDED + 1.5 * delta, atol=1e-9)
+
+    # An out-of-limits waypoint must be rejected at publish time, not executed.
+    ok, _ = controller.cancel_escape()
+    assert ok
+    bad = FakeEscapePlanner([[200.0, 0.0, 0.0, 0.0, 0.0], [*FOLDED]])
+    controller._escape_planner = bad
+    ok, message = controller.trigger_escape([1.0, 0.0, 0.0])
+    assert ok, message
+    worker_args = (controller._q[:5].copy(), np.asarray([1.0, 0.0, 0.0]), controller._escape_generation, 1.0)
+    controller._escape_worker(*worker_args)
+    assert controller.status()["escape_state"] == "failed"
+    assert "rejected by runtime validation" in controller.status()["escape_last_reason"]
+    assert np.allclose(controller.current_arm_joints()[:5], FOLDED, atol=1e-9)
+
+
+def test_dry_run_and_hardware_perform_identical_escape_actions():
+    delta = ESC_DELTA
+
+    class StaticRobot:
+        is_connected = True
+
+        def __init__(self):
+            self.actions = []
+
+        def get_observation(self):
+            measured = np.array([-20.0, 40.0, -30.0, 15.0, 10.0, 1.568])
+            return {f"{name}.pos": measured[index] for index, name in enumerate(ALL_JOINTS)}
+
+        def send_action(self, action):
+            self.actions.append(action.copy())
+            return action
+
+        def disconnect(self):
+            self.is_connected = False
+
+    def run(robot):
+        fake = FakeEscapePlanner([[*FOLDED], [*(FOLDED + delta)]])
+        controller = _escape_controller(fake, robot=robot)
+        sent = []
+        spawn_args = None
+        for _ in range(controller.config.trap_tick_threshold):
+            spawn_args = controller._note_tracking_failure()
+            if spawn_args is not None:
+                break
+        controller._escape_worker(*spawn_args)
+        now = controller._last_tick
+        for _ in range(10):
+            now += 1.0 / controller.config.fps
+            controller._latest_phone_time = now
+            controller._tick(now)
+            sent.append(controller._last_sent_command_q.copy())
+            if controller.status()["escape_state"] != "executing":
+                break
+        return sent
+
+    dry_sent = run(None)
+    robot = StaticRobot()
+    hardware_sent = run(robot)
+
+    assert len(dry_sent) == len(hardware_sent) > 1
+    for dry_command, hardware_command in zip(dry_sent, hardware_sent):
+        assert np.allclose(dry_command, hardware_command, atol=1e-10)
