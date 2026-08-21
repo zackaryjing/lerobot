@@ -146,6 +146,9 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+!target/
+target/*
+!target/wooden_target.stl
 
 # mypy
 .dmypy.json
@@ -174,6 +177,21 @@ outputs/
 # Dev folders
 .cache/*
 *.stl
+!target/wooden_target.stl
 *.urdf
 *.xml
 *.part
+
+# The local MuJoCo workcell is intentionally self-contained and vendors the
+# licensed SO-101 meshes plus its MJCF model files.
+!simulation/mujoco_wood_pick/**/*.stl
+!simulation/mujoco_wood_pick/**/*.xml
+simulation/mujoco_wood_pick/config/appearance.local.json
+
+# Vendored SO-101 URDF and meshes referenced by examples/phone_to_so101 and
+# experiments; kept in-tree so fresh clones can run IK without extra downloads.
+!SO101/*.urdf
+!SO101/**/*.stl
+
+# Local MuJoCo runtime log written to the repo root.
+MUJOCO_LOG.TXT

@@ -1,0 +1,29 @@
+{
+  "materials": {
+    "base_motor_holder_so101_v1_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "base_so101_v2_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "waveshare_mounting_plate_so101_v2_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "motor_holder_so101_base_v1_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "rotation_pitch_so101_v1_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "upper_arm_so101_v1_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "under_arm_so101_v1_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "motor_holder_so101_wrist_v1_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "wrist_roll_pitch_so101_v2_material": {"rgb": [0.72, 0.72, 0.70], "roughness": 0.68},
+    "sts3215_03a_v1_material": {"rgb": [0.025, 0.025, 0.025], "roughness": 0.62},
+    "sts3215_03a_no_horn_v1_material": {"rgb": [0.025, 0.025, 0.025], "roughness": 0.62},
+    "wrist_roll_follower_so101_v1_material": {"rgb": [0.025, 0.025, 0.025], "roughness": 0.68},
+    "moving_jaw_so101_v1_material": {"rgb": [0.025, 0.025, 0.025], "roughness": 0.68},
+    "table": {"rgb": [0.48, 0.47, 0.47], "roughness": 0.72},
+    "platform_white": {"rgb": [0.72, 0.73, 0.72], "roughness": 0.62},
+    "platform_teal": {"rgb": [0.0, 0.16, 0.17], "roughness": 0.68},
+    "cardboard": {"rgb": [0.20, 0.105, 0.055], "roughness": 0.88},
+    "box_bottom": {"rgb": [0.34, 0.19, 0.018], "roughness": 0.82},
+    "wood": {"rgb": [0.27, 0.125, 0.035], "roughness": 0.68}
+  },
+  "lighting": {
+    "headlight_ambient": [0.24, 0.24, 0.23],
+    "headlight_diffuse": [0.27, 0.27, 0.26],
+    "key_diffuse": [0.78, 0.72, 0.64],
+    "fill_diffuse": [0.28, 0.34, 0.42]
+  }
+}

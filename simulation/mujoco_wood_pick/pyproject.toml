@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "joyand-mujoco-wood-pick"
+version = "0.1.0"
+description = "Measured SO-101 wood pick-and-place workcell for MuJoCo"
+requires-python = ">=3.10"
+dependencies = [
+  "gymnasium>=0.29",
+  "imageio[ffmpeg]>=2.34",
+  "mink>=1.2.0,<2",
+  "mujoco>=3.3.7,<4",
+  "numpy>=1.24",
+  "pillow>=10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

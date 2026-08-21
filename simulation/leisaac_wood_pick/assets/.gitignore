@@ -1,0 +1,4 @@
+*.usd
+*.usd.*
+!leisaac/robots/so101_follower.usd
+!.gitkeep

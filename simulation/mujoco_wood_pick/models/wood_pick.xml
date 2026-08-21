@@ -1,0 +1,101 @@
+<mujoco model="joyand_so101_wood_pick">
+  <include file="so101.xml"/>
+
+  <size memory="64M"/>
+
+  <visual>
+    <global offwidth="640" offheight="480" azimuth="155" elevation="-25"/>
+    <quality shadowsize="2048" offsamples="2"/>
+    <headlight ambient="0.16 0.16 0.15" diffuse="0.32 0.31 0.29" specular="0.08 0.08 0.08"/>
+    <rgba haze="0.0 0.0 0.0 1"/>
+  </visual>
+
+  <statistic center="0.10 0.30 0.15" extent="0.72"/>
+
+  <asset>
+    <!-- The source STL is in millimetres with bounds (0,0,0) to
+         (11.5,11.5,80). refpos centres it before metre scaling. -->
+    <mesh name="wooden_target" file="../../wooden_target.stl" scale="0.001 0.001 0.001"
+      refpos="5.75 5.75 40" maxhullvert="128" inertia="convex"/>
+    <mesh name="wooden_target_collision" file="../../wooden_target_collision.obj"
+      maxhullvert="8" inertia="convex"/>
+
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.82 0.84 0.86" rgb2="0.52 0.55 0.58"
+      width="512" height="3072"/>
+
+    <!-- Video-measured sRGB values converted to shader-linear RGB. -->
+    <material name="table" rgba="0.527115 0.508881 0.450786 1" roughness="0.72"/>
+    <material name="platform_white" rgba="0.808 0.816 0.804 1" roughness="0.62"/>
+    <material name="platform_teal" rgba="0.000000 0.068478 0.076185 1" roughness="0.68"/>
+    <material name="cardboard" rgba="0.097587 0.048172 0.022174 1" roughness="0.88"/>
+    <material name="box_bottom" rgba="0.376262 0.147027 0.006049 1" roughness="0.82"/>
+    <material name="wood" rgba="0.215861 0.068478 0.010960 1" roughness="0.68"/>
+  </asset>
+
+  <default>
+    <default class="workcell_static">
+      <geom type="box" contype="1" conaffinity="1" condim="3" friction="0.85 0.005 0.0001"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <!-- User frame: origin at the rear-edge midpoint of the arm base,
+         +X right, +Y forward, +Z up, tabletop at Z=0. -->
+    <geom name="table" class="workcell_static" size="0.45 0.40 0.025" pos="0.10 0.30 -0.025"
+      material="table"/>
+
+    <geom name="platform" class="workcell_static" size="0.135 0.050 0.0265" pos="0.235 0.362 0.0265"
+      material="platform_white"/>
+    <!-- Visual-only skin on the world -X face. -->
+    <geom name="platform_left_face" type="box" size="0.00025 0.050 0.0265" pos="0.09975 0.362 0.0265"
+      contype="0" conaffinity="0" material="platform_teal"/>
+
+    <!-- Open destination box: lower-left=(-0.107,0.380,0),
+         outside size=(0.150,0.100,0.085), wall=0.003. -->
+    <geom name="box_floor" class="workcell_static" size="0.072 0.047 0.0015" pos="-0.032 0.430 0.0015"
+      material="box_bottom"/>
+    <geom name="box_left" class="workcell_static" size="0.0015 0.050 0.0425" pos="-0.1055 0.430 0.0425"
+      material="cardboard"/>
+    <geom name="box_right" class="workcell_static" size="0.0015 0.050 0.0425" pos="0.0415 0.430 0.0425"
+      material="cardboard"/>
+    <geom name="box_near" class="workcell_static" size="0.072 0.0015 0.0425" pos="-0.032 0.3815 0.0425"
+      material="cardboard"/>
+    <geom name="box_far" class="workcell_static" size="0.072 0.0015 0.0425" pos="-0.032 0.4785 0.0425"
+      material="cardboard"/>
+
+    <body name="stick" pos="0.235 0.362 0.05875" quat="0.70710678 0 0.70710678 0">
+      <freejoint name="stick_free"/>
+      <geom name="stick_visual" type="mesh" mesh="wooden_target" material="wood" mass="0.030"
+        contype="0" conaffinity="0"/>
+      <!-- Physics deliberately ignores the Lu Ban lock cut-outs: this is an
+           explicit eight-vertex 11.5 x 11.5 x 80 mm convex block. A mesh geom
+           retains the intended full-block shape while avoiding a degenerate
+           primitive box-box manifold against the platform. -->
+      <geom name="stick_geom" type="mesh" mesh="wooden_target_collision" mass="0"
+        group="3" contype="1" conaffinity="1" condim="6" friction="0.70 0.005 0.0001"
+        solimp="0.95 0.99 0.001" solref="0.005 1" priority="1"/>
+    </body>
+
+    <!-- Fixed overhead camera. The -90 degree roll in the tabletop plane
+         matches the clockwise-mounted real camera. DFOV=100 followed by the
+         measured central 60% crop gives an effective VFOV of 46.44 degrees. -->
+    <camera name="front" mode="fixed" pos="0.060 0.230 0.595" quat="0.70710678 0 0 -0.70710678"
+      fovy="46.44" resolution="640 480"/>
+
+    <!-- Main illumination: above the arm and 0.5 m to its right. -->
+    <light name="key" mode="fixed" pos="0.50 0.02 1.20" dir="-0.38 0.22 -0.90" diffuse="1.0 0.93 0.82"
+      specular="0.16 0.14 0.12" directional="false" castshadow="true" cutoff="80" exponent="8"/>
+    <light name="fill" mode="fixed" pos="-0.35 0.20 0.80" dir="0.35 0.18 -0.75" diffuse="0.32 0.38 0.46"
+      specular="0.03 0.04 0.05" directional="true" castshadow="false"/>
+
+    <camera name="overview" mode="fixed" pos="-0.48 -0.22 0.56" xyaxes="0.82 -0.57 0 0.30 0.43 0.85"
+      fovy="48" resolution="960 720"/>
+  </worldbody>
+
+  <!-- Disabled by default. Retained only as an explicit legacy/debug option;
+       normal scripted-control validation uses physical jaw contacts alone. -->
+  <equality>
+    <weld name="scripted_grasp_weld" body1="gripper" body2="stick" active="false"
+      relpose="0 0 0 1 0 0 0" solref="0.01 1"/>
+  </equality>
+</mujoco>
