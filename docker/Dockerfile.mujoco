@@ -1,0 +1,70 @@
+# LeRobot + MuJoCo (SO101 wood-pick) 训练/推理环境
+#
+# 复现自 WSL conda 环境 lerobot (Python 3.10.20)，关键版本:
+#   torch==2.8.0(+cu128) torchvision==0.23.0 torchcodec==0.6.0
+#   mujoco==3.11.0 mink==1.2.0 placo==0.9.23 gymnasium==1.3.0
+#   lerobot==0.4.3 (本仓库源码安装) joyand-mujoco-wood-pick==0.1.0
+#
+# 构建:
+#   docker build -f docker/Dockerfile.mujoco -t lerobot-mujoco:v0.1 .
+#   # 若 daemon 直连网络受限，构建时加代理参数:
+#   #   --build-arg HTTP_PROXY=http://host.docker.internal:18080 \
+#   #   --build-arg HTTPS_PROXY=http://host.docker.internal:18080
+#
+# 运行 (GPU):
+#   docker run -it --rm --gpus all \
+#     -v /usr/lib/wsl:/usr/lib/wsl \
+#     lerobot-mujoco:v0.1
+#   !! WSL2 必须挂载 /usr/lib/wsl: Docker Desktop 注入的驱动库与宿主机
+#   !! 驱动版本不匹配, 会导致 torch 报 "CUDA Error 500"。推荐用
+#   !! docker/run.sh 一键启动。原生 Linux 宿主机无需此挂载。
+# 运行 (无GPU/CPU渲染): 容器内 export MUJOCO_GL=osmesa
+# 挂载本地代码/数据:
+#   docker run -it --rm --gpus all -v $(pwd):/lerobot lerobot-mujoco:v0.1
+#
+# 推送到镜像仓库:
+#   docker tag lerobot-mujoco:v0.1 <registry>/<namespace>/lerobot-mujoco:v0.1
+#   docker push <registry>/<namespace>/lerobot-mujoco:v0.1
+
+FROM python:3.10-slim-bookworm
+
+LABEL org.opencontainers.image.title="lerobot-mujoco" \
+      org.opencontainers.image.description="LeRobot 0.4.3 + MuJoCo 3.11 + torch 2.8.0 cu128 for SO101 wood-pick" \
+      org.opencontainers.image.source="https://github.com/example/lerobot_joyand"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    MUJOCO_GL=egl \
+    HF_HOME=/root/.cache/huggingface \
+    HF_LEROBOT_HOME=/root/.cache/huggingface/lerobot \
+    TORCH_HOME=/root/.cache/torch
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+# 系统依赖:
+#   ffmpeg            -> torchcodec / imageio 视频编解码
+#   libegl1 libgl1 ... -> MuJoCo headless 渲染 (EGL, 可用GPU)
+#   libosmesa6         -> MuJoCo 纯CPU软件渲染回退
+#   libusb-1.0-0       -> Feetech/Dynamixel 舵机 USB 串口
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake pkg-config ninja-build git curl \
+        ffmpeg fonts-dejavu-core \
+        libglib2.0-0 libegl1 libgl1 libgles2 libosmesa6 libglfw3 libopengl0 \
+        libusb-1.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 依赖: 按锁文件精确复现当前已验证环境 (torch/mujoco 等 175 个包)
+COPY docker/requirements-docker.lock.txt /tmp/requirements-docker.lock.txt
+RUN pip install --index-url "${PIP_INDEX_URL}" -r /tmp/requirements-docker.lock.txt
+
+# 项目源码 + 本仓库两个包的可编辑安装
+# (挂载 -v 覆盖 /lerobot 后无需重装即可改代码)
+WORKDIR /lerobot
+COPY . .
+RUN pip install --no-index --no-build-isolation --no-deps \
+        -e . -e ./simulation/mujoco_wood_pick \
+    && python -c "import lerobot, mujoco_wood_pick; print('editable installs OK')"
+
+CMD ["/bin/bash"]
