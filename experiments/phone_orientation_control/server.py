@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""HTTPS/WebSocket server for Android inline orientation control of SO101."""
+"""HTTPS/WebSocket server for Android inline orientation control of SO101.
+
+Android WebXR `inline` orientation is only exposed in secure contexts, so the
+server speaks HTTPS. TLS material (project-local CA + server leaf, see
+tls_certs.py) is generated automatically on first start, and /ca.crt serves
+the CA root so a phone can trust this address once, with no warnings.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,6 @@ import asyncio
 import json
 import logging
 import math
-import socket
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
@@ -49,6 +54,7 @@ active_phone_id: str | None = None
 active_phone_ws: WebSocket | None = None
 robot_urdf_path = DEFAULT_URDF
 direction_atlas_path = DEFAULT_ATLAS
+cert_dir: Path = DEFAULT_CERT_DIR
 
 
 class SimPlanRequest(BaseModel):
@@ -82,6 +88,20 @@ async def phone_page():
 @app.get("/status")
 async def status():
     return controller.status() if controller else {"status": "controller not started"}
+
+
+@app.get("/ca.crt")
+async def local_ca_certificate():
+    """Project-local CA root; install it once on the phone to trust this server."""
+    path = cert_dir / "rootCA.crt"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="local CA certificate not found")
+    return FileResponse(
+        path,
+        media_type="application/x-x509-ca-cert",
+        headers={"Cache-Control": "no-store"},
+        filename="rootCA.crt",
+    )
 
 
 @app.get("/viz")
@@ -280,23 +300,11 @@ async def status_broadcaster() -> None:
                     await ws.close(code=1011, reason="status send timeout")
 
 
-def local_ip() -> str:
-    sock: socket.socket | None = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(("8.8.8.8", 80))
-        return str(sock.getsockname()[0])
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        if sock is not None:
-            sock.close()
-
-
 def make_controller(
     args: argparse.Namespace,
     state_validator=None,
     escape_planner=None,
+    fallback_planner=None,
 ) -> OrientationController:
     config = ControlConfig()
     limits = load_joint_limits(args.urdf, args.calibration)
@@ -335,6 +343,7 @@ def make_controller(
         reset_joints=reset_joints,
         state_validator=state_validator,
         escape_planner=escape_planner,
+        fallback_planner=fallback_planner,
     )
     try:
         instance.start()
@@ -356,7 +365,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--server-port", type=int, default=4445)
-    parser.add_argument("--cert-dir", type=Path, default=DEFAULT_CERT_DIR)
+    parser.add_argument(
+        "--cert-dir",
+        type=Path,
+        default=DEFAULT_CERT_DIR,
+        help="directory for key.pem/cert.pem and the local CA root; generated on first start",
+    )
     parser.add_argument("--reset-pose", type=Path, default=DEFAULT_RESET_POSE)
     parser.add_argument("--atlas", type=Path, default=DEFAULT_ATLAS)
     parser.add_argument("--collisions", type=Path, default=DEFAULT_COLLISIONS)
@@ -371,11 +385,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="disable the direction-preserving escape/reconfiguration planner",
     )
+    parser.add_argument(
+        "--body-model",
+        action="store_true",
+        help="forbid the box-composed pseudo-human zones behind the base (obstacles.py)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    global controller, direction_atlas_path, global_planner, robot_urdf_path
+    global controller, direction_atlas_path, global_planner, robot_urdf_path, cert_dir
     args = parse_args()
     robot_urdf_path = args.urdf
     direction_atlas_path = args.atlas
@@ -384,21 +403,37 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler(), logging.FileHandler(THIS_DIR / "control.log")],
     )
+    # WebXR needs a secure context, so HTTPS stays; make its certificates
+    # painless instead: create the local CA + leaf covering every current
+    # non-loopback address (campus LAN and Tailscale 100.x alike), and
+    # refresh the leaf whenever that address set changes.
+    from tls_certs import detect_ipv4_addresses, ensure_certificates
+
+    addresses = detect_ipv4_addresses()
+    cert_dir = args.cert_dir
+    ensure_certificates(cert_dir, log=log)
     required_paths = [
         args.urdf,
         args.calibration,
         args.reset_pose,
         args.collisions,
-        args.cert_dir / "key.pem",
-        args.cert_dir / "cert.pem",
     ]
-    if not args.hardware:
+    if not args.hardware or not args.no_escape:
         required_paths.append(args.atlas)
     for path in required_paths:
         if not path.exists():
             raise FileNotFoundError(path)
     from direction_atlas import SO101StateValidator
 
+    # Forbidden zones (e.g. the wearer's body in the future back mounting) are
+    # shared read-only across every validator instance so tracking, escape
+    # planning, and global planning all agree on the same environment.
+    obstacle_env = None
+    if args.body_model:
+        from obstacles import make_pseudo_human
+
+        obstacle_env = make_pseudo_human()
+        log.info("body model active: %s", obstacle_env.names())
     limits = load_joint_limits(args.urdf, args.calibration)
     tracking_validator = SO101StateValidator(
         args.urdf,
@@ -406,6 +441,7 @@ def main() -> None:
         limits,
         min_tip_height_m=-math.inf,
         min_moving_frame_height_m=-math.inf,
+        obstacles=obstacle_env,
     )
 
     def validate_tracking_target(joints):
@@ -423,17 +459,44 @@ def main() -> None:
         limits,
         min_tip_height_m=-math.inf,
         min_moving_frame_height_m=-math.inf,
+        obstacles=obstacle_env,
     )
     escape_planner = None if args.no_escape else EscapePlanner(escape_validator)
+    # Free-space fallback for escapes whose frozen direction is far from the
+    # trapped pose (e.g. pointing backward past the shoulder_pan sweep): the
+    # atlas + PlaCo refinement + RRT-Connect machinery, shared with the dry-run
+    # global planner but on a tracking-strictness validator and its own placo
+    # stack. It runs sequentially after the manifold planner in the same
+    # worker thread, so there is no validator contention.
+    fallback_planner = None
+    if not args.no_escape:
+        from global_planner import GlobalDirectionPlanner
+
+        fallback_validator = SO101StateValidator(
+            args.urdf,
+            args.collisions,
+            limits,
+            min_tip_height_m=-math.inf,
+            min_moving_frame_height_m=-math.inf,
+            obstacles=obstacle_env,
+        )
+        fallback_planner = GlobalDirectionPlanner(
+            args.atlas,
+            fallback_validator,
+            manual_samples_path=args.manual_samples,
+        )
     controller = make_controller(
-        args, state_validator=validate_tracking_target, escape_planner=escape_planner
+        args,
+        state_validator=validate_tracking_target,
+        escape_planner=escape_planner,
+        fallback_planner=fallback_planner,
     )
     if args.hardware:
         global_planner = None
     else:
         from global_planner import GlobalDirectionPlanner
 
-        planning_validator = SO101StateValidator(args.urdf, args.collisions, limits)
+        planning_validator = SO101StateValidator(args.urdf, args.collisions, limits, obstacles=obstacle_env)
 
         global_planner = GlobalDirectionPlanner(
             args.atlas,
@@ -442,13 +505,18 @@ def main() -> None:
         )
 
     mode = "HARDWARE" if args.hardware else "DRY-RUN"
-    address = local_ip()
-    print(
-        f"\nPhone orientation control [{mode}]"
-        f"\n  phone: https://{address}:{args.server_port}"
-        f"\n  digital twin: https://{address}:{args.server_port}/viz"
-        f"\n  status: https://{address}:{args.server_port}/status\n"
+    lines = [f"\nPhone orientation control [{mode}]"]
+    lines += [
+        f"\n  phone: https://{addr}:{args.server_port}"
+        f"\n  digital twin: https://{addr}:{args.server_port}/viz"
+        for addr in addresses
+    ]
+    lines.append(
+        f"\n  phone trust (once): open any of the .../ca.crt URLs above on the"
+        f"\n    Android phone, install rootCA.crt as a CA certificate, and that"
+        f"\n    https address (LAN or Tailscale 100.x) is trusted without warnings\n"
     )
+    print("".join(lines))
     try:
         uvicorn.run(
             app,

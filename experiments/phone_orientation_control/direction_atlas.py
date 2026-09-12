@@ -16,6 +16,7 @@ import placo
 
 from controller import ARM_JOINTS, ControlConfig, load_joint_limits
 from frame_adapter import gripper_tip_in_robot
+from obstacles import ObstacleEnvironment
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -56,7 +57,12 @@ class AtlasCandidate:
 
 
 class SO101StateValidator:
-    """Joint-limit, floor-envelope, and non-adjacent self-collision validator."""
+    """Joint-limit, floor-envelope, and non-adjacent self-collision validator.
+
+    ``obstacles`` optionally adds forbidden-zone checks: the moving links are
+    approximated as a sphere chain (see ``obstacles.py``) and every sample
+    must keep the configured margin from every registered zone.
+    """
 
     MOVING_FRAMES = ("shoulder_link", "upper_arm_link", "lower_arm_link", "wrist_link", "gripper_frame_link")
 
@@ -67,6 +73,7 @@ class SO101StateValidator:
         joint_limits: dict[str, tuple[float, float]],
         min_tip_height_m: float = 0.055,
         min_moving_frame_height_m: float = 0.012,
+        obstacles: ObstacleEnvironment | None = None,
     ) -> None:
         self.robot = placo.RobotWrapper(str(urdf_path))
         self.robot.load_collision_pairs(str(collision_pairs_path))
@@ -76,6 +83,7 @@ class SO101StateValidator:
         self.span = self.high - self.low
         self.min_tip_height_m = min_tip_height_m
         self.min_moving_frame_height_m = min_moving_frame_height_m
+        self.obstacles = obstacles
         self._collision_objects = self.robot.collision_model.geometryObjects
         self.robot.set_joint("gripper", 0.0)
 
@@ -103,6 +111,10 @@ class SO101StateValidator:
             for frame in self.MOVING_FRAMES
         ):
             return None, "link_below_floor_envelope"
+        if self.obstacles is not None:
+            distance = self.obstacles.distance_m(self.robot)
+            if distance < self.obstacles.margin_m:
+                return None, "obstacle_collision"
 
         direction = gripper_tip_in_robot(pose[:3, :3])
         normalized_margin = np.minimum(joints_deg - self.low, self.high - joints_deg) / (self.span / 2.0)

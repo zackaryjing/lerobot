@@ -352,6 +352,14 @@ class ControlConfig:
     escape_planning_timeout_s: float = 12.0
     escape_loop_window_s: float = 60.0
     escape_loop_limit: int = 3
+    # Anticipatory free-space planning: while stall ticks accumulate toward
+    # the trap threshold, a background worker plans from the current pose to
+    # the current target so the trap can adopt it without a planning pause.
+    preplan_enabled: bool = True
+    preplan_tick_threshold: int = 2
+    preplan_reuse_rad: float = math.radians(5.0)
+    preplan_min_interval_s: float = 1.0
+    preplan_timeout_s: float = 4.0
 
 
 @dataclass
@@ -388,6 +396,7 @@ class OrientationController:
         reset_joints: np.ndarray | None = None,
         state_validator: Callable[[np.ndarray], bool] | None = None,
         escape_planner: EscapePlannerLike | None = None,
+        fallback_planner: EscapePlannerLike | None = None,
     ) -> None:
         self.kinematics = kinematics
         self.joint_limits = joint_limits
@@ -397,6 +406,7 @@ class OrientationController:
         self.hardware = robot is not None
         self._state_validator = state_validator
         self._escape_planner = escape_planner
+        self._fallback_planner = fallback_planner
         self._lock = threading.Lock()
         self._kinematics_lock = threading.RLock()
         self._validation_lock = threading.RLock()
@@ -443,6 +453,9 @@ class OrientationController:
         self._escape_outcome_counts: dict[str, int] = {}
         self._escape_history: list[tuple[float, np.ndarray]] = []
         self._escape_path_payload: tuple[int, dict[str, Any]] | None = None
+        self._preplan: tuple[np.ndarray, Any] | None = None
+        self._preplan_worker_active = False
+        self._preplan_last_started = -math.inf
         initial_joints = (
             dry_initial_joints
             if dry_initial_joints is not None
@@ -586,6 +599,7 @@ class OrientationController:
                 self._cancel_escape_locked("sync disabled")
             self._sync_enabled = enabled
             self._plan = None
+            self._preplan = None  # direction cache is meaningless across sync edges
             if enabled:
                 self._sim_trajectory = None
                 self._sim_waypoint_index = 0
@@ -598,6 +612,7 @@ class OrientationController:
         with self._lock:
             if self._escape_state != "idle":
                 self._cancel_escape_locked("calibration invalidated")
+            self._preplan = None  # planned for a direction in the old mapping
             self._calibrated = False
             self._sync_enabled = False
             self._latest_phone_quat = None
@@ -630,6 +645,7 @@ class OrientationController:
                 self._cancel_escape_locked("reset requested")
             self._sync_enabled = False
             self._plan = None
+            self._preplan = None
             path = self._valid_path_suffix(self._q[:5], self._startup_q[:5])
             if path is None:
                 return False, "reset target is outside calibration limits or self-colliding"
@@ -763,7 +779,63 @@ class OrientationController:
             self._reset_trap_locked()
             return None
         self._escape_trap_ticks += 1
+        self._maybe_start_preplan_locked()
         return self._maybe_trigger_escape_locked()
+
+    def _maybe_start_preplan_locked(self) -> None:
+        """Kick off an anticipatory free-space plan once stalls accumulate.
+
+        Runs in the background while tracking continues; the trap adopts the
+        cached plan without a planning pause when the frozen direction still
+        matches. Uses the fallback (free-space) planner only: it is fast, is
+        thread-safe, and the direction-preserving tier rarely converges from
+        trap-like poses anyway.
+        """
+        cfg = self.config
+        if not cfg.preplan_enabled or self._fallback_planner is None:
+            return
+        if self._escape_state != "idle" or self._preplan_worker_active:
+            return
+        if self._escape_trap_ticks < cfg.preplan_tick_threshold:
+            return
+        now = time.monotonic()
+        if now - self._preplan_last_started < cfg.preplan_min_interval_s:
+            return
+        direction = self._live_target_direction_locked()
+        if direction is None:
+            return
+        if self._preplan is not None and vector_angle(self._preplan[0], direction) <= cfg.preplan_reuse_rad:
+            return  # a usable plan for this direction already exists
+        self._preplan_worker_active = True
+        self._preplan_last_started = now
+        start_q = self._q[:5].copy()
+        threading.Thread(
+            target=self._preplan_worker, args=(start_q, direction), name="escape-preplan", daemon=True
+        ).start()
+
+    def _preplan_worker(self, start_q: np.ndarray, direction: np.ndarray) -> None:
+        deadline = time.monotonic() + self.config.preplan_timeout_s
+        try:
+            plan_obj = self._fallback_planner.plan(
+                start_q,
+                direction,
+                cancel_event=self._escape_cancel,
+                deadline=deadline,
+            )
+        except Exception:  # noqa: BLE001 - worker must never crash silently
+            logger.exception("pre-planning failed")
+            plan_obj = None
+        with self._lock:
+            self._preplan_worker_active = False
+            if plan_obj is None or self._escape_state != "idle":
+                return
+            live = self._live_target_direction_locked()
+            if live is None or vector_angle(live, direction) > self.config.preplan_reuse_rad:
+                return  # the target moved while planning; the result is stale
+            if getattr(plan_obj, "method", ""):
+                plan_obj.method = f"global:{plan_obj.method}"
+            self._preplan = (direction, plan_obj)
+            logger.info("pre-plan cached for trap adoption")
 
     def _note_tracking_failure(self) -> tuple | None:
         """Record a rejected IK tick; returns escape worker spawn args if triggered."""
@@ -790,7 +862,9 @@ class OrientationController:
 
     def _maybe_trigger_escape_locked(self) -> tuple | None:
         cfg = self.config
-        if not cfg.escape_enabled or self._escape_planner is None:
+        if not cfg.escape_enabled or (
+            self._escape_planner is None and self._fallback_planner is None
+        ):
             return None
         if self._escape_state != "idle":
             return None
@@ -798,7 +872,10 @@ class OrientationController:
             return None
         if self._sim_trajectory is not None:
             return None
-        now = time.monotonic()
+        # Use the control loop's own clock so trap timing is consistent with
+        # the tick that registers stalls; wall and logical time coincide in the
+        # live system but not under fast simulated test harnesses.
+        now = self._last_tick
         if now - self._latest_phone_time > cfg.phone_stale_timeout_s:
             return None
         if now < self._escape_next_allowed_time:
@@ -823,30 +900,73 @@ class OrientationController:
         self._reset_trap_locked()
         self._last_error = ""
         self._last_status = "escape planning; holding last command"
+        # Adopt an anticipatory pre-plan when it still matches the frozen
+        # direction, so the escape starts executing without a planning pause.
+        precomputed = None
+        if (
+            self._preplan is not None
+            and vector_angle(self._preplan[0], self._escape_direction)
+            <= self.config.preplan_reuse_rad
+        ):
+            precomputed = self._preplan[1]
+        self._preplan = None
         return (
             self._q[:5].copy(),
             self._escape_direction.copy(),
             self._escape_generation,
             self.config.escape_planning_timeout_s,
+            precomputed,
         )
 
-    def _escape_worker(self, start_q: np.ndarray, direction: np.ndarray, generation: int, timeout_s: float) -> None:
+    def _escape_worker(
+        self,
+        start_q: np.ndarray,
+        direction: np.ndarray,
+        generation: int,
+        timeout_s: float,
+        precomputed: Any = None,
+    ) -> None:
         deadline = time.monotonic() + timeout_s
-        try:
-            plan_obj = self._escape_planner.plan(
-                start_q,
-                direction,
-                cancel_event=self._escape_cancel,
-                deadline=deadline,
-            )
-        except Exception as exc:  # noqa: BLE001 - worker must never crash silently
-            logger.exception("escape planning failed")
-            plan_obj = None
-            with self._lock:
-                self._publish_escape_plan_locked(None, generation, reason=f"planner error: {exc}")
-            return
+        plan_obj = precomputed
+        failure_reason = "no manifold or free-space plan within budget"
+        # A precomputed anticipatory plan skips both tiers: it was already
+        # validated by its planner and is re-validated at publish time.
+        # Tier 1: direction-preserving manifold detour. Only converges when the
+        # trapped pose sits near the frozen direction's manifold, so large
+        # branch switches (e.g. pointing backward past the shoulder_pan limit)
+        # usually exhaust it quickly.
+        if plan_obj is None and self._escape_planner is not None and not self._escape_cancel.is_set():
+            try:
+                plan_obj = self._escape_planner.plan(
+                    start_q,
+                    direction,
+                    cancel_event=self._escape_cancel,
+                    deadline=deadline,
+                )
+            except Exception as exc:  # noqa: BLE001 - worker must never crash silently
+                logger.exception("escape planning failed")
+                failure_reason = f"planner error: {exc}"
+                plan_obj = None
+        # Tier 2: free joint-space plan (atlas seeds + PlaCo refinement +
+        # RRT-Connect) to any branch pointing at the frozen direction. The tip
+        # may deviate from the target mid-path; acceptable while the phone is
+        # paused, and playback is guarded by the same drift abort as tier 1.
+        if plan_obj is None and self._fallback_planner is not None and not self._escape_cancel.is_set():
+            try:
+                plan_obj = self._fallback_planner.plan(
+                    start_q,
+                    direction,
+                    cancel_event=self._escape_cancel,
+                    deadline=deadline,
+                )
+                if plan_obj is not None and getattr(plan_obj, "method", ""):
+                    plan_obj.method = f"global:{plan_obj.method}"
+            except Exception as exc:  # noqa: BLE001 - worker must never crash silently
+                logger.exception("fallback escape planning failed")
+                failure_reason = f"fallback planner error: {exc}"
+                plan_obj = None
         with self._lock:
-            self._publish_escape_plan_locked(plan_obj, generation)
+            self._publish_escape_plan_locked(plan_obj, generation, reason=failure_reason)
 
     def _publish_escape_plan_locked(self, plan_obj: Any, generation: int, reason: str | None = None) -> None:
         """Validate and adopt (or reject) a finished plan. Caller holds ``_lock``."""
@@ -936,7 +1056,9 @@ class OrientationController:
             index += 1
         if index >= len(plan_q):
             with self._lock:
-                self._finish_escape_terminal_locked("completed", "completed")
+                self._finish_escape_terminal_locked(
+                    "completed", f"completed via {self._escape_last_reason}"
+                )
             self._update_tip_state(q[:5])
             return
         live_target = self._live_target_direction_locked_safe()
@@ -1006,6 +1128,7 @@ class OrientationController:
         self._escape_plan_q = None
         self._escape_index = 0
         self._escape_direction = None
+        self._preplan = None
         if terminal:
             self._escape_state = "failed"
             self._escape_last_reason = reason
@@ -1016,7 +1139,7 @@ class OrientationController:
             self._escape_last_reason = reason
 
     def _arm_cooldown_locked(self) -> None:
-        self._escape_next_allowed_time = time.monotonic() + self.config.escape_cooldown_s
+        self._escape_next_allowed_time = self._last_tick + self.config.escape_cooldown_s
 
     def _record_escape_outcome_locked(self, outcome: str) -> None:
         self._escape_outcome_counts[outcome] = self._escape_outcome_counts.get(outcome, 0) + 1
@@ -1102,7 +1225,8 @@ class OrientationController:
                 "last_rejection": self._last_rejection,
                 "last_error": self._last_error,
                 "status": self._last_status,
-                "escape_enabled": self.config.escape_enabled and self._escape_planner is not None,
+                "escape_enabled": self.config.escape_enabled
+                and (self._escape_planner is not None or self._fallback_planner is not None),
                 "escape_state": self._escape_state,
                 "escape_last_reason": self._escape_last_reason,
                 "escape_progress": {
@@ -1119,6 +1243,8 @@ class OrientationController:
                 "escape_frozen_direction": (
                     None if self._escape_direction is None else self._escape_direction.tolist()
                 ),
+                "preplan_ready": self._preplan is not None,
+                "preplan_worker_active": self._preplan_worker_active,
             }
 
     def _run(self) -> None:
@@ -1161,6 +1287,16 @@ class OrientationController:
             sim_waypoint_index = self._sim_waypoint_index
             escape_state = self._escape_state
 
+        # Publish the actual tip direction every tick, not only while
+        # synchronization runs, so the twin's achieved arrow matches the
+        # rendered arm pose from the very first status message.
+        with self._kinematics_lock:
+            current_pose = self.kinematics.forward_kinematics(q[:5])
+        current_direction = gripper_tip_in_robot(current_pose[:3, :3])
+        with self._lock:
+            self._current_tip_direction = current_direction.copy()
+            self._tip_position_m = current_pose[:3, 3].copy()
+
         if sim_trajectory is not None:
             self._tick_simulated_trajectory(q, sim_trajectory, sim_waypoint_index)
             return
@@ -1200,13 +1336,8 @@ class OrientationController:
             return
         self._housekeep_escape(now)
         target_direction = phone_forward_in_robot(mapping, quat_to_matrix(filtered_q))
-        with self._kinematics_lock:
-            current_pose = self.kinematics.forward_kinematics(q[:5])
-        current_direction = gripper_tip_in_robot(current_pose[:3, :3])
         with self._lock:
-            self._current_tip_direction = current_direction.copy()
             self._target_tip_direction = target_direction.copy()
-            self._tip_position_m = current_pose[:3, 3].copy()
 
         desired_direction = self._next_direction(
             self._control_time_s,

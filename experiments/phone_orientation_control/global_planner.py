@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ class GlobalPlannerConfig:
     atlas_seeds: int = 16
     refined_candidates: int = 8
     refinement_iterations: int = 40
+    random_seed_attempts: int = 64
     direction_tolerance_rad: float = math.radians(0.20)
     candidate_branch_separation: float = 0.08
     edge_resolution_deg: float = 3.0
@@ -194,6 +196,32 @@ class GlobalDirectionPlanner:
                 goals.append(goal)
                 if len(goals) >= self.config.refined_candidates:
                     break
+            # Sparse atlas regions (e.g. directions past the shoulder_pan sweep)
+            # hold only a handful of candidates. Refine random seeds with the
+            # same PlaCo pass to fill those gaps instead of failing the plan.
+            for _ in range(self.config.random_seed_attempts):
+                if len(goals) >= self.config.refined_candidates:
+                    break
+                raw = self._rng.uniform(self.low, self.high)
+                goal = self._refine(
+                    {
+                        "joints_deg": raw.tolist(),
+                        "direction": target.tolist(),
+                        "joint_margin": 0.0,
+                    },
+                    target,
+                    current,
+                )
+                if goal is None:
+                    continue
+                q = np.asarray(goal.joints_deg)
+                if any(
+                    self._normalized_distance(q, np.asarray(existing.joints_deg))
+                    < self.config.candidate_branch_separation
+                    for existing in goals
+                ):
+                    continue
+                goals.append(goal)
             goals.sort(key=lambda goal: goal.current_distance + 0.08 * (1.0 - goal.joint_margin))
             return goals
 
@@ -243,7 +271,13 @@ class GlobalDirectionPlanner:
             if status != "advanced":
                 return status, index
 
-    def _rrt_connect(self, start_deg: np.ndarray, goal_deg: np.ndarray) -> list[np.ndarray] | None:
+    def _rrt_connect(
+        self,
+        start_deg: np.ndarray,
+        goal_deg: np.ndarray,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> list[np.ndarray] | None:
         if self._edge_valid(start_deg, goal_deg):
             return [start_deg, goal_deg]
         start = self._normalized(start_deg)
@@ -252,6 +286,10 @@ class GlobalDirectionPlanner:
         nodes_b, parents_b = [goal], [-1]
         a_is_start = True
         for _ in range(self.config.rrt_iterations_per_goal):
+            if (cancel_event is not None and cancel_event.is_set()) or (
+                deadline is not None and time.monotonic() > deadline
+            ):
+                return None
             sample = goal if self._rng.random() < self.config.rrt_goal_bias else self._rng.random(5)
             status_a, index_a = self._extend(nodes_a, parents_a, sample)
             if status_a != "trapped" and index_a is not None:
@@ -285,7 +323,13 @@ class GlobalDirectionPlanner:
     def _path_length(self, path: list[np.ndarray]) -> float:
         return sum(self._normalized_distance(first, second) for first, second in zip(path, path[1:]))
 
-    def plan(self, current_joints_deg: np.ndarray, target_direction: np.ndarray) -> PlannedPath | None:
+    def plan(
+        self,
+        current_joints_deg: np.ndarray,
+        target_direction: np.ndarray,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> PlannedPath | None:
         with self._lock:
             current = np.asarray(current_joints_deg, dtype=float)
             if not self._is_valid(current):
@@ -293,7 +337,13 @@ class GlobalDirectionPlanner:
             goals = self.find_goals(target_direction, current)
             best: PlannedPath | None = None
             for goal in goals[: self.config.goals_to_plan]:
-                raw_path = self._rrt_connect(current, np.asarray(goal.joints_deg))
+                if (cancel_event is not None and cancel_event.is_set()) or (
+                    deadline is not None and time.monotonic() > deadline
+                ):
+                    break
+                raw_path = self._rrt_connect(
+                    current, np.asarray(goal.joints_deg), cancel_event=cancel_event, deadline=deadline
+                )
                 if raw_path is None:
                     continue
                 path = self._shortcut(raw_path)

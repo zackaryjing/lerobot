@@ -56,13 +56,32 @@ escape instead of holding forever:
   ticks where the local IK step is rejected or makes no error progress while the
   phone target stays stable, the current target direction freezes and a planner
   worker starts. Fast deliberate phone motions reset the counter instead.
-- **Planner** (`escape_planner.py`): constrained sampling on the direction
-  manifold {q valid : tip_dir(q) within a 3° cone of the target}. Random seeds
-  are projected onto the manifold with the same bounded direction-IK step the
-  tracker uses; goals are scored by joint margin and task manipulability; a
-  CBiRRT-Connect-style search connects the start to the best goal with every
-  edge sampled for limits, self-collision, and cone membership. Paths are
-  resampled so no command exceeds `escape_waypoint_delta_deg` (2°) per tick.
+- **Pre-planning**: as soon as a few stall ticks accumulate (default 2), a
+  background worker plans a free-space path from the current pose to the
+  current target with the fallback planner. When the trap then fires and the
+  frozen direction still matches (within `preplan_reuse_rad`, default 5°), the
+  cached plan is adopted immediately — the trap-to-execution gap becomes the
+  stall threshold plus playback, with no planning pause. A moved target
+  invalidates the cache at completion and the worker replans at trap time.
+  `preplan_enabled`/`preplan_min_interval_s`/`preplan_timeout_s` tune it.
+- **Planner** (two tiers, run sequentially in the escape worker):
+  - `escape_planner.py`: constrained sampling on the direction
+    manifold {q valid : tip_dir(q) within a 3° cone of the target}. Random seeds
+    are projected onto the manifold with the same bounded direction-IK step the
+    tracker uses; goals are scored by joint margin and task manipulability; a
+    CBiRRT-Connect-style search connects the start to the best goal with every
+    edge sampled for limits, self-collision, and cone membership. This tier only
+    converges when the trapped pose sits near the frozen direction's manifold.
+  - Free-space fallback (`global_planner.py`): when the manifold plan fails —
+    e.g. a target far past the shoulder_pan sweep, like pointing backward — the
+    worker replans with the atlas + PlaCo refinement + RRT-Connect machinery on
+    a tracking-strictness validator (no floor envelopes). Sparse atlas regions
+    are backfilled by refining random seeds with the same PlaCo pass. The tip
+    direction may deviate from the target mid-path; playback runs under the same
+    drift-abort guard, so this is meant for pauses, when the phone is stable.
+    Adopted plans report `global:direct` / `global:rrt_connect` as their method.
+  Paths from either tier are resampled so no command exceeds
+  `escape_waypoint_delta_deg` (2°) per tick.
 - **Execution**: playback runs *inside* synchronization. Phone updates keep
   streaming and filtering; if the live target moves more than 12° away from the
   frozen direction mid-flight, the escape aborts at waypoint granularity and
@@ -82,6 +101,30 @@ escape instead of holding forever:
 - Constraint strictness matches tracking (no floor envelopes); the old atlas /
   global planner remains dry-run only and unchanged.
 
+## Forbidden zones (future wearable mounting)
+
+The arm's final mounting is on a person's back with the base plate parallel to
+the back (the current +X forward direction becomes up). `obstacles.py` provides
+the interface for body collision avoidance:
+
+- `ObstacleEnvironment`: forbidden zones in **robot-base coordinates**, with
+  `add_box(name, center, half_extents, rotation)` for fast primitives and
+  `add_mesh(name, path, transform)` for OBJ/STL models (hppfcl BVH meshes, the
+  hook for real 3D body models). Zones carry a clearance `margin_m` (default
+  2 cm). `apply_transform(R, t)` re-poses an entire environment, which is how
+  the same human model definition is re-mounted when the base orientation
+  changes.
+- The moving links (shoulder → gripper tip) are approximated as a chain of
+  spheres along the joint-origin polyline; every validator instance that
+  carries the environment rejects configurations whose proxy comes within the
+  margin of any zone (`obstacle_collision`). The base plate itself is excluded:
+  it is the attachment surface and is expected to touch the wearer.
+- Tracking IK, escape planning, the free-space fallback, and the dry-run
+  global planner all share one read-only environment, so every adopted path
+  is body-aware end to end. `make_pseudo_human()` builds a box-composed
+  stand-in (torso behind the base, shoulder boxes, head offset to +Y) for
+  testing; pass `--body-model` to the server to enable it.
+
 ## Run without hardware
 
 ```bash
@@ -89,9 +132,24 @@ PYTHONPATH=src /home/jing/miniconda3/envs/lerobot/bin/python \
   experiments/phone_orientation_control/server.py
 ```
 
-Open the printed HTTPS address on Android. Accept the self-signed certificate,
-start the inline sensor, calibrate, then enable synchronization. The page clearly
-shows `DRY-RUN`.
+Android WebXR `inline` orientation is only exposed in secure contexts, so the
+server speaks HTTPS. To avoid both an unusable server (missing certificate)
+and a phone that flags a self-signed cert as a high-risk site, the first start
+generates a project-local CA and a server leaf certificate under
+`experiments/phone_pose_viz/` (gitignored; `tls_certs.py` regenerates them).
+Trusting this CA once on the phone makes the printed address permanently valid:
+
+1. Open the printed `https://<lan-ip>:4445/ca.crt` address on the phone and
+   download `rootCA.crt`.
+2. Android: Settings > Security > Encryption & credentials > Install a
+   certificate > CA certificate, then pick `rootCA.crt` from Downloads
+   (the screen lock PIN is required).
+3. Now open the printed main HTTPS address: start the inline sensor, calibrate,
+   then enable synchronization. The page clearly shows `DRY-RUN`.
+
+When the machine's LAN IP changes, the server (or `tls_certs.py`) renews the
+leaf certificate for the new IP on the next start; the CA root already
+installed on the phone keeps working unchanged.
 
 Open the printed `/viz` address on the laptop for the digital twin. It loads the
 actual SO101 URDF/STL files and applies the dry-run controller's joint values at

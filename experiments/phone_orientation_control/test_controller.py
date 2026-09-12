@@ -2,6 +2,7 @@
 
 import json
 import math
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,7 @@ from escape_planner import EscapePlanner, EscapePlannerConfig
 from frame_adapter import GRIPPER_TIP_LOCAL, PHONE_FORWARD_LOCAL
 from direction_atlas import AtlasConfig, DirectionAtlasBuilder, SO101StateValidator, fibonacci_sphere
 from global_planner import GlobalDirectionPlanner, GlobalPlannerConfig
+from obstacles import ObstacleEnvironment, make_pseudo_human
 from record_direction_samples import ManualSampleStore
 
 
@@ -928,6 +930,310 @@ def test_escape_publish_revalidates_waypoints_and_bridges_from_live_commanded_q(
     assert controller.status()["escape_state"] == "failed"
     assert "rejected by runtime validation" in controller.status()["escape_last_reason"]
     assert np.allclose(controller.current_arm_joints()[:5], FOLDED, atol=1e-9)
+
+
+class FakeFallbackPlanner:
+    """Deterministic free-space planner stub standing in for the global planner."""
+
+    def __init__(self, waypoints_deg, method="rrt_connect"):
+        self.waypoints_deg = waypoints_deg
+        self.method = method
+        self.calls = []
+
+    def plan(self, start_joints_deg, target_direction, cancel_event=None, deadline=None):
+        self.calls.append((np.asarray(start_joints_deg).copy(), np.asarray(target_direction).copy()))
+        return SimpleNamespace(
+            waypoints_deg=[list(map(float, waypoint)) for waypoint in self.waypoints_deg],
+            target_direction=list(map(float, target_direction)),
+            goal=SimpleNamespace(direction_error_deg=0.0),
+            method=self.method,
+            planning_time_s=0.0,
+            tree_nodes=0,
+            projections=0,
+        )
+
+
+def test_escape_falls_back_to_global_planner_when_manifold_plan_fails():
+    delta = ESC_DELTA
+    fallback = FakeFallbackPlanner([[*(FOLDED + delta)], [*(FOLDED + 1.5 * delta)]], method="rrt_connect")
+    controller = _escape_controller(FailingEscapePlanner())
+    controller._fallback_planner = fallback
+    assert controller.status()["escape_enabled"]
+
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = controller._note_tracking_failure()
+        if spawn_args is not None:
+            break
+    assert spawn_args is not None
+    controller._escape_worker(*spawn_args)
+
+    assert fallback.calls, "fallback planner was never invoked after the manifold plan failed"
+    assert np.allclose(fallback.calls[0][0], FOLDED)
+    assert controller.status()["escape_state"] == "executing"
+    assert controller.status()["escape_last_reason"] == "global:rrt_connect"
+
+
+def test_escape_trigger_requires_any_planner_but_accepts_fallback_only():
+    # A fallback-only controller must still be able to trigger and execute.
+    fallback = FakeFallbackPlanner([[*(FOLDED + ESC_DELTA)]])
+    controller = _escape_controller(None)
+    controller._fallback_planner = fallback
+    assert controller.status()["escape_enabled"]
+
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = controller._note_tracking_failure()
+        if spawn_args is not None:
+            break
+    assert spawn_args is not None
+    controller._escape_worker(*spawn_args)
+    assert controller.status()["escape_state"] == "executing"
+
+    # With no planner at all the trap still counts but never triggers.
+    bare = _escape_controller(None)
+    assert not bare.status()["escape_enabled"]
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = bare._note_tracking_failure()
+    assert spawn_args is None
+
+
+def _build_180_controller(obstacle_env):
+    calibration = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower/myfollower01.json"
+    limits = load_joint_limits(ROOT / "SO101/so101_new_calib.urdf", calibration)
+    hard_limits = load_calibration_limits(calibration)
+    kinematics = RobotKinematics(str(ROOT / "SO101/so101_new_calib.urdf"), joint_names=ARM_JOINTS)
+
+    def make_validator():
+        return SO101StateValidator(
+            ROOT / "SO101/so101_new_calib.urdf",
+            ROOT / "SO101/collisions.json",
+            limits,
+            min_tip_height_m=-math.inf,
+            min_moving_frame_height_m=-math.inf,
+            obstacles=obstacle_env,
+        )
+
+    tracking_validator = make_validator()
+    reset_data = json.loads((HERE / "reset_pose_myfollower01.json").read_text())
+    reset_joints = [float(reset_data["joints_deg"][name]) for name in ALL_JOINTS]
+    return OrientationController(
+        kinematics,
+        limits,
+        config=ControlConfig(),
+        hard_joint_limits=hard_limits,
+        reset_joints=np.asarray(reset_joints),
+        state_validator=lambda joints: tracking_validator.evaluate(joints)[0] is not None,
+        escape_planner=EscapePlanner(make_validator()),
+        fallback_planner=GlobalDirectionPlanner(HERE / "direction_atlas.json", make_validator()),
+    )
+
+
+def _drive_180_rotation(controller):
+    """Phone forward, slow clockwise rotation with pauses, 180 degrees total.
+
+    Paced in real time because the escape/pre-plan workers run on the wall clock.
+    """
+    controller.submit_phone_orientation([0.0, 0.0, 0.0, 1.0])
+    assert controller.calibrate()[0]
+    assert controller.set_sync(True)[0]
+    dt = 1.0 / controller.config.fps
+
+    def yaw(theta_deg):
+        angle = math.radians(theta_deg)
+        return [0.0, 0.0, math.sin(angle / 2.0), math.cos(angle / 2.0)]
+
+    def tick(theta_deg):
+        controller.submit_phone_orientation(yaw(theta_deg))
+        now = controller._last_tick + dt
+        controller._latest_phone_time = now  # paced loop keeps sim and wall clocks together
+        controller._tick(now)
+        time.sleep(dt)
+
+    def rotate(from_deg, to_deg, seconds):
+        frames = int(seconds * controller.config.fps)
+        for frame in range(frames):
+            tick(from_deg + (to_deg - from_deg) * frame / frames)
+
+    def pause(theta_deg, seconds):
+        for _ in range(int(seconds * controller.config.fps)):
+            tick(theta_deg)
+
+    rotate(0.0, -135.0, 3.0)
+    pause(-135.0, 7.0)
+    rotate(-135.0, -180.0, 3.0)
+    pause(-180.0, 6.0)
+
+
+def _assert_reached_backward(controller):
+    status = controller.status()
+    current = status["current_tip_direction"]
+    backward = np.array([-1.0, 0.0, 0.0])
+    assert vector_angle(current, backward) < math.radians(3.0), (
+        f"tip did not reach backward: error {math.degrees(vector_angle(current, backward)):.1f} deg"
+    )
+    assert status["escape_outcome_counts"].get("completed", 0) >= 1, (
+        "the branch switch must go through a completed escape"
+    )
+    payload = controller.escape_path_payload()
+    assert payload is not None and "global" in payload[1]["method"], (
+        "the large-direction escape must have used the free-space fallback planner"
+    )
+
+
+def test_escape_180_degree_rotation_end_to_end():
+    """The user's minimal failing case: phone forward, slow clockwise rotation
+    with pauses, 180 degrees total. The tip must end pointing backward even
+    though the shoulder_pan sweep alone cannot get there.
+    """
+    controller = _build_180_controller(obstacle_env=None)
+    _drive_180_rotation(controller)
+    _assert_reached_backward(controller)
+
+
+def test_escape_180_degree_rotation_end_to_end_with_body_model():
+    """The same rotation with the box-composed pseudo-human behind the base:
+    every adopted path must keep the arm clear of the forbidden zones."""
+    controller = _build_180_controller(obstacle_env=make_pseudo_human())
+    _drive_180_rotation(controller)
+    _assert_reached_backward(controller)
+
+
+# --------------------------------------------------------------------------
+# Forbidden-zone (body model) interface
+# --------------------------------------------------------------------------
+
+
+def _validator_with(obstacle_env):
+    calibration = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower/myfollower01.json"
+    limits = load_joint_limits(ROOT / "SO101/so101_new_calib.urdf", calibration)
+    return SO101StateValidator(
+        ROOT / "SO101/so101_new_calib.urdf",
+        ROOT / "SO101/collisions.json",
+        limits,
+        min_tip_height_m=-math.inf,
+        min_moving_frame_height_m=-math.inf,
+        obstacles=obstacle_env,
+    )
+
+
+def test_obstacle_zone_rejects_colliding_arm_and_releases_when_removed():
+    environment = ObstacleEnvironment()
+    validator = _validator_with(environment)
+    folded = np.array([7.824, -103.868, 89.835, 66.769, -1.978])
+    assert validator.evaluate(folded)[0] is not None
+
+    # Park a box exactly on the upper-arm midpoint of the folded pose.
+    validator.set_configuration(folded)
+    shoulder = validator.robot.get_T_world_frame("shoulder_link")[:3, 3]
+    elbow = validator.robot.get_T_world_frame("lower_arm_link")[:3, 3]
+    environment.add_box("arm_blocker", center=0.5 * (shoulder + elbow), half_extents=[0.05, 0.05, 0.05])
+
+    candidate, reason = validator.evaluate(folded)
+    assert candidate is None and reason == "obstacle_collision"
+
+    environment.remove("arm_blocker")
+    assert validator.evaluate(folded)[0] is not None
+
+
+def test_obstacle_apply_transform_moves_the_zones():
+    environment = ObstacleEnvironment()
+    validator = _validator_with(environment)
+    folded = np.array([7.824, -103.868, 89.835, 66.769, -1.978])
+    validator.set_configuration(folded)
+    shoulder = validator.robot.get_T_world_frame("shoulder_link")[:3, 3]
+    elbow = validator.robot.get_T_world_frame("lower_arm_link")[:3, 3]
+    environment.add_box("arm_blocker", center=0.5 * (shoulder + elbow), half_extents=[0.05, 0.05, 0.05])
+    assert validator.evaluate(folded)[0] is None
+
+    # Re-posing the same zone elsewhere must clear the arm again. This is the
+    # hook used when the mounting changes (e.g. base parallel to the back).
+    moved = environment.apply_transform(np.eye(3), np.array([0.0, 0.0, 0.5]))
+    assert moved.names() == ["arm_blocker"]
+    moved_validator = _validator_with(moved)
+    assert moved_validator.evaluate(folded)[0] is not None
+
+
+def test_pseudo_human_rejects_backward_reach_through_the_head_but_planner_adapts():
+    environment = make_pseudo_human()
+    validator = _validator_with(environment)
+    trapped = np.array([119.9, -104.2, 64.7, 41.6, -2.0])
+    assert validator.evaluate(trapped)[0] is not None, "trapped pose must stay clear"
+
+    # A backward-pointing branch whose tip reaches through the head zone is
+    # invalid with the body model...
+    through_head = np.array([0.0, -74.5, -36.0, -69.4, -2.0])
+    candidate, reason = validator.evaluate(through_head)
+    assert candidate is None and reason == "obstacle_collision"
+
+    # ...and the global planner picks a different, clear branch instead.
+    planner = GlobalDirectionPlanner(HERE / "direction_atlas.json", validator)
+    result = planner.plan(trapped, np.array([-1.0, 0.0, 0.0]))
+    assert result is not None
+    assert all(validator.evaluate(np.asarray(waypoint))[0] is not None for waypoint in result.waypoints_deg)
+    assert result.goal.direction_error_deg <= 0.2
+
+
+# --------------------------------------------------------------------------
+# Anticipatory pre-planning
+# --------------------------------------------------------------------------
+
+
+def test_preplan_caches_plan_and_trap_adopts_it_without_replanning():
+    fallback = FakeFallbackPlanner([[*(FOLDED + ESC_DELTA)], [*(FOLDED + 2 * ESC_DELTA)]])
+    controller = _escape_controller(FailingEscapePlanner())
+    controller._fallback_planner = fallback
+
+    for _ in range(controller.config.preplan_tick_threshold):
+        controller._note_tracking_failure()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not controller.status()["preplan_ready"]:
+        time.sleep(0.01)
+    assert controller.status()["preplan_ready"], "pre-plan never cached"
+
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = controller._note_tracking_failure()
+        if spawn_args is not None:
+            break
+    assert spawn_args is not None
+    controller._escape_worker(*spawn_args)
+
+    assert controller.status()["escape_state"] == "executing"
+    assert len(fallback.calls) == 1, "trap must adopt the cached pre-plan without a second planning call"
+    assert controller.status()["escape_last_reason"] == "global:rrt_connect"
+
+
+def test_trap_replans_when_cached_preplan_direction_no_longer_matches():
+    fallback = FakeFallbackPlanner([[*(FOLDED + ESC_DELTA)], [*(FOLDED + 2 * ESC_DELTA)]])
+    # Pre-planning is disabled here so the stale cache cannot be refreshed by a
+    # background worker before the trap fires.
+    controller = _escape_controller(FailingEscapePlanner(), preplan_enabled=False)
+    controller._fallback_planner = fallback
+    # A cached plan for the forward direction becomes useless once the phone
+    # turns away; the worker must plan again instead of adopting it.
+    controller._preplan = (
+        np.array([1.0, 0.0, 0.0]),
+        SimpleNamespace(waypoints_deg=[[*FOLDED]], method="global:direct", goal=SimpleNamespace()),
+    )
+    angle = np.deg2rad(60.0)
+    rotation_z = np.array(
+        [[np.cos(angle), -np.sin(angle), 0.0], [np.sin(angle), np.cos(angle), 0.0], [0.0, 0.0, 1.0]]
+    )
+    with controller._lock:
+        controller._phone_to_robot_rotation = rotation_z @ controller._phone_to_robot_rotation
+    # The anchor resets when the live target jumps; rebuild the stall count.
+    spawn_args = None
+    for _ in range(controller.config.trap_tick_threshold):
+        spawn_args = controller._note_tracking_failure()
+        if spawn_args is not None:
+            break
+    assert spawn_args is not None
+    controller._escape_worker(*spawn_args)
+
+    assert controller.status()["escape_state"] == "executing"
+    assert len(fallback.calls) == 1, "worker must replan when the cached direction is stale"
 
 
 def test_dry_run_and_hardware_perform_identical_escape_actions():

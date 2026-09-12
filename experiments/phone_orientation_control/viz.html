@@ -44,6 +44,17 @@ const screen=new THREE.Mesh(new THREE.BoxGeometry(.38,.70,.01),new THREE.MeshPho
 const topMark=new THREE.Mesh(new THREE.BoxGeometry(.18,.025,.012),new THREE.MeshBasicMaterial({color:0x93c5fd}));topMark.position.set(0,.33,.041);phone.add(topMark);
 phone.add(new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(),.62,0x4ade80,.12,.07));
 phoneScene.add(new THREE.AxesHelper(.6));
+// Before the phone sends any orientation, show it in the pose that corresponds
+// to the robot's current tip direction: phone top edge (+Y) along the tip, so
+// the two green arrows start consistent instead of phone-up vs robot-forward.
+const PHONE_TOP_AXIS=new THREE.Vector3(0,1,0);
+function alignPhoneWithTip(direction){
+  if(!direction)return;
+  const dir=new THREE.Vector3(...direction);if(dir.lengthSq()<0.5)return;
+  dir.normalize();
+  if(Math.abs(dir.dot(PHONE_TOP_AXIS))>0.9999)return; // near-180° has no unique roll
+  phone.quaternion.setFromUnitVectors(PHONE_TOP_AXIS,dir);
+}
 
 // Robot view uses URDF Z-up coordinates directly.
 const robotHost=document.getElementById('robot-view'),robotScene=new THREE.Scene();robotScene.background=new THREE.Color(0x101625);addLights(robotScene);
@@ -147,7 +158,9 @@ function connect(){
   ws=new WebSocket(`wss://${location.host}/viz-ws`);
   ws.onmessage=e=>{const m=JSON.parse(e.data);
     if(m.type==='escape_path'){drawEscapePath(m);planResult=`逃逸路径已加载: ${m.method}, ${m.waypoints_deg.length} 路点`;return}
-    const s=m;applyStatus(s);const q=s.phone_quat;if(q)phone.quaternion.set(q[0],q[1],q[2],q[3]);const ast=atlasData?.stats;const path=s.sim_path_active?`${s.sim_waypoint+1}/${s.sim_waypoint_count}`:'idle';const escapeProgress=s.escape_progress?`${s.escape_progress.index}/${s.escape_progress.count}`:'-/-';panel.innerHTML=`<span class="${s.phone_fresh?'ok':'bad'}">● ${s.phone_fresh?'phone fresh':'phone stale'}</span>　${s.hardware?'HARDWARE':'DRY-RUN'}${previewCandidate?'　<span class="cyan">ATLAS PREVIEW</span>':''}\nURDF: ${robotLoaded?'loaded':'loading'}　WS reconnects: ${reconnects}\natlas: ${ast?`${ast.occupied_bins}/${ast.total_bins} bins, ${ast.retained_candidates} candidates`:'loading'}\nbackend: ${s.tracking_backend||'-'}　global path: ${path}　${s.status||''}\n<span class="${s.escape_state==='failed'?'bad':s.escape_state==='executing'?'ok':''}">escape: ${s.escape_state||'-'} ${escapeProgress} ${s.escape_last_reason||''}</span>　stall: ${s.escape_trap_ticks??0}　outcomes: ${JSON.stringify(s.escape_outcome_counts||{})}\n${planResult}\ncalibrated: ${s.calibrated}　sync: ${s.sync_enabled}　mode: ${s.mode}\ntip error: ${s.tip_error_deg??'-'}°\nrejects: ${s.reject_count}　${s.last_rejection||'-'}\nplanned: ${JSON.stringify(s.planned_joints_deg||s.joints_deg||{})}\nmeasured: ${JSON.stringify(s.measured_joints_deg||{})}`;if(document.getElementById('direction-preset').value==='live'&&!previewCandidate)updateCandidateList()};
+    const s=m;applyStatus(s);const q=s.phone_quat;
+    if(q){phone.quaternion.set(q[0],q[1],q[2],q[3])}else{alignPhoneWithTip(s.current_tip_direction)}
+    const ast=atlasData?.stats;const path=s.sim_path_active?`${s.sim_waypoint+1}/${s.sim_waypoint_count}`:'idle';const escapeProgress=s.escape_progress?`${s.escape_progress.index}/${s.escape_progress.count}`:'-/-';panel.innerHTML=`<span class="${s.phone_fresh?'ok':'bad'}">● ${s.phone_fresh?'phone fresh':'phone stale'}</span>　${s.hardware?'HARDWARE':'DRY-RUN'}${previewCandidate?'　<span class="cyan">ATLAS PREVIEW</span>':''}\nURDF: ${robotLoaded?'loaded':'loading'}　WS reconnects: ${reconnects}\natlas: ${ast?`${ast.occupied_bins}/${ast.total_bins} bins, ${ast.retained_candidates} candidates`:'loading'}\nbackend: ${s.tracking_backend||'-'}　global path: ${path}　${s.status||''}\n<span class="${s.escape_state==='failed'?'bad':s.escape_state==='executing'?'ok':''}">escape: ${s.escape_state||'-'} ${escapeProgress} ${s.escape_last_reason||''}</span>　stall: ${s.escape_trap_ticks??0}　outcomes: ${JSON.stringify(s.escape_outcome_counts||{})}\n${planResult}\ncalibrated: ${s.calibrated}　sync: ${s.sync_enabled}　mode: ${s.mode}\ntip error: ${s.tip_error_deg??'-'}°\nrejects: ${s.reject_count}　${s.last_rejection||'-'}\nplanned: ${JSON.stringify(s.planned_joints_deg||s.joints_deg||{})}\nmeasured: ${JSON.stringify(s.measured_joints_deg||{})}`;if(document.getElementById('direction-preset').value==='live'&&!previewCandidate)updateCandidateList()};
   ws.onclose=()=>{reconnects++;panel.textContent='可视化连接断开，正在重试…';setTimeout(connect,1000)};
 }
 
