@@ -691,6 +691,7 @@ class OrientationController:
             self._last_rejection = ""
             self._last_error = ""
             self._last_status = "new browser session; calibration required"
+            self._input_device = "phone"
 
     def set_mode(self, mode: str) -> tuple[bool, str]:
         if mode not in ("smooth", "realtime"):
