@@ -3,31 +3,49 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SO101 手机控制数字孪生</title>
+<title>SO101 输入设备数字孪生</title>
 <style>
 *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#0b1020;color:#e5e7eb;font:13px ui-monospace,monospace}
 #views{display:grid;grid-template-columns:1fr 1.55fr;width:100%;height:100%;gap:2px;background:#273047}
 .view{position:relative;min-width:0;min-height:0;background:#101625;overflow:hidden}.view canvas{display:block;width:100%;height:100%}
+#device-pane>.view{position:absolute;inset:0}
+#device-pane>.view[hidden]{display:none !important}
+#device-switch{position:absolute;z-index:5;left:10px;bottom:12px;display:flex;gap:6px;align-items:center;padding:8px;border-radius:8px;background:#000c}
 .title{position:absolute;z-index:2;left:10px;top:10px;padding:7px 10px;border-radius:7px;background:#000a;font-weight:700;pointer-events:none}
 #panel{position:absolute;z-index:4;right:10px;top:10px;width:min(410px,calc(100% - 20px));max-height:45%;overflow:auto;padding:10px 12px;border-radius:8px;background:#000c;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none}
 #atlas-controls{position:absolute;z-index:5;left:calc(40% + 18px);bottom:12px;display:flex;gap:7px;align-items:center;flex-wrap:wrap;max-width:calc(60% - 28px);padding:8px;border-radius:8px;background:#000c}
 select,button{background:#1f2937;color:#e5e7eb;border:1px solid #4b5563;border-radius:6px;padding:7px}button{cursor:pointer}button:hover{background:#374151}
 .ok{color:#4ade80}.bad{color:#f87171}.cyan{color:#22d3ee}.green{color:#4ade80}
-@media(max-width:760px){#views{grid-template-columns:1fr;grid-template-rows:.72fr 1.28fr}#panel{top:auto;bottom:62px;max-height:25%;font-size:11px}#atlas-controls{left:8px;bottom:7px;max-width:calc(100% - 16px);font-size:11px}.title{font-size:11px}}
+@media(max-width:900px){#views{grid-template-columns:1fr;grid-template-rows:.72fr 1.28fr}#panel{top:auto;bottom:62px;max-height:22%;font-size:11px}#atlas-controls{left:8px;bottom:7px;max-width:calc(100% - 16px);font-size:11px}.title{font-size:11px}}
 </style>
 </head>
 <body>
 <div id="views">
-  <div id="phone-view" class="view"><div class="title">手机姿态（绿色箭头 = 顶部前方）</div></div>
+  <div id="device-pane" class="view">
+    <div id="phone-view" class="view"><div class="title">手机姿态（仅手机数据）</div></div>
+    <div id="mpu-view" class="view" hidden><div class="title">MPU6500（仅芯片数据 · 绿=+Z 红=X 蓝=Y）</div></div>
+    <div id="device-switch">
+      <span>视图</span>
+      <select id="device-view-mode">
+        <option value="auto">自动（跟随连接）</option>
+        <option value="phone">手机</option>
+        <option value="mpu6500">MPU6500</option>
+      </select>
+    </div>
+  </div>
   <div id="robot-view" class="view"><div class="title">SO101 数字孪生　<span class="green">绿色 = 当前尖端</span>　<span class="cyan">青色 = 目标</span></div></div>
 </div>
 <div id="panel">正在加载数字孪生并连接服务端…</div>
-<div id="atlas-controls"><span>方向目标</span><select id="direction-preset"><option value="live">手机实时目标</option><option value="front">正前方</option><option value="back">正后方</option><option value="down">正下方</option><option value="up">正上方</option><option value="left">左</option><option value="right">右</option></select><select id="atlas-candidate" disabled><option>尚无候选</option></select><button id="preview" disabled>预览图谱候选</button><button id="plan-play">全局规划并播放</button><button id="stop-plan">停止</button><button id="live">返回实时</button><button id="trigger-escape" title="保持尖端朝向不变，绕开限位重新配置关节">触发逃逸</button><button id="cancel-escape">取消逃逸</button></div>
+<div id="atlas-controls"><span>方向目标</span><select id="direction-preset"><option value="live">实时目标</option><option value="front">正前方</option><option value="back">正后方</option><option value="down">正下方</option><option value="up">正上方</option><option value="left">左</option><option value="right">右</option></select><select id="atlas-candidate" disabled><option>尚无候选</option></select><button id="preview" disabled>预览图谱候选</button><button id="plan-play">全局规划并播放</button><button id="stop-plan">停止</button><button id="live">返回实时</button><button id="trigger-escape" title="保持尖端朝向不变，绕开限位重新配置关节">触发逃逸</button><button id="cancel-escape">取消逃逸</button></div>
 <script type="importmap">
 {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
 </script>
 <script type="module">
 import * as THREE from 'three';
+
+// Bump when viz.html changes; shown in the pane titles so a cached page is obvious.
+const VIZ_VERSION=5;
+for(const el of document.querySelectorAll('.view .title'))el.textContent+=` ·viz v${VIZ_VERSION}`;
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 import {STLLoader} from 'three/addons/loaders/STLLoader.js';
 
@@ -54,6 +72,83 @@ function alignPhoneWithTip(direction){
   dir.normalize();
   if(Math.abs(dir.dot(PHONE_TOP_AXIS))>0.9999)return; // near-180° has no unique roll
   phone.quaternion.setFromUnitVectors(PHONE_TOP_AXIS,dir);
+}
+
+// MPU view: independent scene / camera / transform. Z-up world, labeled axes.
+// Does NOT share mesh or quaternion state with the phone block.
+const mpuHost=document.getElementById('mpu-view'),mpuScene=new THREE.Scene();mpuScene.background=new THREE.Color(0x101625);addLights(mpuScene);
+const mpuCamera=new THREE.PerspectiveCamera(45,1,.01,20);
+mpuCamera.up.set(0,0,1);
+mpuCamera.position.set(0.95,-1.15,0.85);
+mpuCamera.lookAt(0,0,0);
+const mpuRenderer=makeRenderer(mpuHost);
+const mpuOrbit=new OrbitControls(mpuCamera,mpuRenderer.domElement);mpuOrbit.enableDamping=true;mpuOrbit.target.set(0,0,0);
+const mpuGrid=new THREE.GridHelper(1.4,28,0x496080,0x273047);mpuGrid.rotation.x=Math.PI/2;mpuScene.add(mpuGrid);
+
+function axisLabelSprite(text,colorCss){
+  const c=document.createElement('canvas');c.width=128;c.height=64;
+  const g=c.getContext('2d');
+  g.clearRect(0,0,128,64);
+  g.font='bold 48px ui-monospace,monospace';g.textAlign='center';g.textBaseline='middle';
+  g.fillStyle=colorCss;g.fillText(text,64,34);
+  const tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;
+  const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,depthTest:false,transparent:true}));
+  sp.scale.set(0.30,0.15,1);
+  return sp;
+}
+function labeledAxes(len){
+  const g=new THREE.Group();
+  const add=(dir,color,label,css)=>{
+    g.add(new THREE.ArrowHelper(dir,new THREE.Vector3(),len,color,0.07,0.04));
+    const sp=axisLabelSprite(label,css);
+    sp.position.copy(dir.clone().multiplyScalar(len+0.14));
+    g.add(sp);
+  };
+  add(new THREE.Vector3(1,0,0),0xff3333,'X','#ff5555');
+  add(new THREE.Vector3(0,1,0),0x33ff33,'Y','#55ff55');
+  add(new THREE.Vector3(0,0,1),0x3b82f6,'Z','#60a5fa');
+  return g;
+}
+mpuScene.add(labeledAxes(0.72));
+
+const mpu=new THREE.Group();
+mpu.add(new THREE.Mesh(new THREE.BoxGeometry(.46,.62,.035),new THREE.MeshPhongMaterial({color:0x0f766e,shininess:40})));
+const mpuDie=new THREE.Mesh(new THREE.BoxGeometry(.22,.22,.045),new THREE.MeshPhongMaterial({color:0x111827,shininess:20}));
+mpuDie.position.z=.02;mpu.add(mpuDie);
+// 10 separate pins on the clockwise-opposite long edge (-X side), along Y.
+const mpuPinMat=new THREE.MeshPhongMaterial({color:0xf8fafc});
+for(let i=0;i<10;i++){
+  const pin=new THREE.Mesh(new THREE.BoxGeometry(.022,.028,.022),mpuPinMat);
+  pin.position.set(-0.225,-0.20+i*0.045,0.01);
+  mpu.add(pin);
+}
+// Chip-frame axes: X red / Y blue / Z green (green = die normal = control axis).
+mpu.add(new THREE.ArrowHelper(new THREE.Vector3(1,0,0),new THREE.Vector3(),.40,0xff5544,.10,.05));
+mpu.add(new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(),.46,0x4499ff,.10,.05));
+// Forward arrow exits the die perpendicular to the package (+Z).
+mpu.add(new THREE.ArrowHelper(new THREE.Vector3(0,0,1),new THREE.Vector3(0,0,.05),.62,0x4ade80,.12,.07));
+mpuScene.add(mpu);
+mpu.quaternion.identity();
+// Quaternion comes from the server already in the shared MPU frame
+// (bridge applies the -90° Z yaw to the chip quat). Do not add a second yaw here.
+function applyMpuQuat(q){
+  if(!q)return;
+  mpu.quaternion.set(q[0],q[1],q[2],q[3]);
+}
+
+// v-if style: only one device pane visible; the other is hidden and not rendered.
+let activeDevice='phone';
+let deviceViewMode='auto'; // auto | phone | mpu6500
+const deviceViewModeEl=document.getElementById('device-view-mode');
+deviceViewModeEl.onchange=()=>{deviceViewMode=deviceViewModeEl.value;setDevicePane(lastStatus.input_device||'phone')};
+function setDevicePane(kind){
+  const connected=(kind==='mpu6500')?'mpu6500':'phone';
+  const next=(deviceViewMode==='auto')?connected:deviceViewMode;
+  const showMpu=next==='mpu6500';
+  if(phoneHost.hidden===showMpu && mpuHost.hidden===!showMpu){activeDevice=next;return}
+  phoneHost.hidden=showMpu;
+  mpuHost.hidden=!showMpu;
+  activeDevice=next;
 }
 
 // Robot view uses URDF Z-up coordinates directly.
@@ -158,14 +253,32 @@ function connect(){
   ws=new WebSocket(`wss://${location.host}/viz-ws`);
   ws.onmessage=e=>{const m=JSON.parse(e.data);
     if(m.type==='escape_path'){drawEscapePath(m);planResult=`逃逸路径已加载: ${m.method}, ${m.waypoints_deg.length} 路点`;return}
-    const s=m;applyStatus(s);const q=s.phone_quat;
-    if(q){phone.quaternion.set(q[0],q[1],q[2],q[3])}else{alignPhoneWithTip(s.current_tip_direction)}
-    const ast=atlasData?.stats;const path=s.sim_path_active?`${s.sim_waypoint+1}/${s.sim_waypoint_count}`:'idle';const escapeProgress=s.escape_progress?`${s.escape_progress.index}/${s.escape_progress.count}`:'-/-';panel.innerHTML=`<span class="${s.phone_fresh?'ok':'bad'}">● ${s.phone_fresh?'phone fresh':'phone stale'}</span>　${s.hardware?'HARDWARE':'DRY-RUN'}${previewCandidate?'　<span class="cyan">ATLAS PREVIEW</span>':''}\nURDF: ${robotLoaded?'loaded':'loading'}　WS reconnects: ${reconnects}\natlas: ${ast?`${ast.occupied_bins}/${ast.total_bins} bins, ${ast.retained_candidates} candidates`:'loading'}\nbackend: ${s.tracking_backend||'-'}　global path: ${path}　${s.status||''}\n<span class="${s.escape_state==='failed'?'bad':s.escape_state==='executing'?'ok':''}">escape: ${s.escape_state||'-'} ${escapeProgress} ${s.escape_last_reason||''}</span>　stall: ${s.escape_trap_ticks??0}　outcomes: ${JSON.stringify(s.escape_outcome_counts||{})}\n${planResult}\ncalibrated: ${s.calibrated}　sync: ${s.sync_enabled}　mode: ${s.mode}\ntip error: ${s.tip_error_deg??'-'}°\nrejects: ${s.reject_count}　${s.last_rejection||'-'}\nplanned: ${JSON.stringify(s.planned_joints_deg||s.joints_deg||{})}\nmeasured: ${JSON.stringify(s.measured_joints_deg||{})}`;if(document.getElementById('direction-preset').value==='live'&&!previewCandidate)updateCandidateList()};
+const s=m;applyStatus(s);
+    // Data only drives the mesh that matches the live source; the other stays still.
+    const device=s.input_device||'phone';
+    setDevicePane(device);
+    const q=s.phone_quat;
+    if(device==='mpu6500'){
+      applyMpuQuat(q);
+    }else if(q){
+      phone.quaternion.set(q[0],q[1],q[2],q[3]);
+    }else{
+      alignPhoneWithTip(s.current_tip_direction);
+    }
+    const ast=atlasData?.stats;const path=s.sim_path_active?`${s.sim_waypoint+1}/${s.sim_waypoint_count}`:'idle';const escapeProgress=s.escape_progress?`${s.escape_progress.index}/${s.escape_progress.count}`:'-/-';panel.innerHTML=`<span class="${s.phone_fresh?'ok':'bad'}">● ${s.phone_fresh?'input fresh':'input stale'}</span>　${s.hardware?'HARDWARE':'DRY-RUN'}　device: ${device}${previewCandidate?'　<span class="cyan">ATLAS PREVIEW</span>':''}\nURDF: ${robotLoaded?'loaded':'loading'}　WS reconnects: ${reconnects}　frame_adapter: ${s.frame_adapter_version??'-'}　viz: ${VIZ_VERSION}\natlas: ${ast?`${ast.occupied_bins}/${ast.total_bins} bins, ${ast.retained_candidates} candidates`:'loading'}\nbackend: ${s.tracking_backend||'-'}　global path: ${path}　${s.status||''}\n<span class="${s.escape_state==='failed'?'bad':s.escape_state==='executing'?'ok':''}">escape: ${s.escape_state||'-'} ${escapeProgress} ${s.escape_last_reason||''}</span>　stall: ${s.escape_trap_ticks??0}　outcomes: ${JSON.stringify(s.escape_outcome_counts||{})}\n${planResult}\ncalibrated: ${s.calibrated}　sync: ${s.sync_enabled}　mode: ${s.mode}\ntip error: ${s.tip_error_deg??'-'}°\nrejects: ${s.reject_count}　${s.last_rejection||'-'}\nplanned: ${JSON.stringify(s.planned_joints_deg||s.joints_deg||{})}\nmeasured: ${JSON.stringify(s.measured_joints_deg||{})}`;if(document.getElementById('direction-preset').value==='live'&&!previewCandidate)updateCandidateList()};
   ws.onclose=()=>{reconnects++;panel.textContent='可视化连接断开，正在重试…';setTimeout(connect,1000)};
 }
 
-function resize(host,camera,renderer){const w=host.clientWidth,h=host.clientHeight;if(renderer.domElement.width!==w||renderer.domElement.height!==h){renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix()}}
-function animate(){requestAnimationFrame(animate);resize(phoneHost,phoneCamera,phoneRenderer);resize(robotHost,robotCamera,robotRenderer);controls.update();phoneRenderer.render(phoneScene,phoneCamera);robotRenderer.render(robotScene,robotCamera)}
+function resize(host,camera,renderer){const w=host.clientWidth||1,h=host.clientHeight||1;if(renderer.domElement.width!==w||renderer.domElement.height!==h){renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix()}}
+function animate(){
+  requestAnimationFrame(animate);
+  if(activeDevice==='mpu6500'){
+    resize(mpuHost,mpuCamera,mpuRenderer);mpuOrbit.update();mpuRenderer.render(mpuScene,mpuCamera);
+  }else{
+    resize(phoneHost,phoneCamera,phoneRenderer);phoneRenderer.render(phoneScene,phoneCamera);
+  }
+  resize(robotHost,robotCamera,robotRenderer);controls.update();robotRenderer.render(robotScene,robotCamera);
+}
 Promise.all([loadRobot(),loadAtlas()]).catch(error=>{panel.textContent=`数字孪生资源加载失败: ${error.stack||error}`});connect();animate();
 </script>
 </body></html>

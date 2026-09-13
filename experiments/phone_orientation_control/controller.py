@@ -415,6 +415,14 @@ class OrientationController:
         self._latest_phone_quat: np.ndarray | None = None
         self._latest_phone_time = 0.0
         self._phone_transport_connected = False
+        self._input_device = "phone"
+        self._orientation_rx_count = 0
+        self._orientation_rx_window_start = time.monotonic()
+        self._orientation_rx_hz = 0.0
+        self._last_orientation_inter_arrival_ms: float | None = None
+        self._prev_orientation_rx_time: float | None = None
+        self._orientation_seq_gaps = 0
+        self._last_orientation_seq: int | None = None
         self._awaiting_reconnect_pose = False
         self._phone_rebase_count = 0
         self._last_phone_rebase_deg = 0.0
@@ -505,14 +513,66 @@ class OrientationController:
         if self.hardware and self.robot.is_connected:
             self.robot.disconnect()
 
-    def submit_phone_orientation(self, quat: list[float]) -> None:
+    def set_input_device(self, kind: str) -> tuple[bool, str]:
+        """Tag the active orientation source and apply its tracking profile."""
+        normalized = str(kind or "").strip().lower()
+        if normalized not in {"phone", "mpu6500"}:
+            return False, f"unknown input device: {kind!r}"
+        with self._lock:
+            self._input_device = normalized
+            if normalized == "mpu6500":
+                # High-rate IMU path: minimize lag so sim tracks real motion.
+                self.config.phone_filter_tau_s = 0.015
+                self.config.realtime_follow_tau_s = 0.02
+                self.config.max_phone_frame_jump_rad = math.radians(90.0)
+                self.config.phone_stale_timeout_s = 0.20
+                self.config.angular_speed_rad_s = math.radians(360.0)
+                self.config.max_orientation_ik_step_rad = math.radians(8.0)
+                self.config.fps = 60.0
+                self._mode = "realtime"
+            else:
+                self.config.phone_filter_tau_s = 0.10
+                self.config.realtime_follow_tau_s = 0.16
+                self.config.max_phone_frame_jump_rad = math.radians(35.0)
+                self.config.phone_stale_timeout_s = 0.50
+                self.config.angular_speed_rad_s = math.radians(45.0)
+                self.config.max_orientation_ik_step_rad = math.radians(3.0)
+                self.config.fps = 30.0
+        return True, f"input device = {normalized}"
+
+    def submit_phone_orientation(self, quat: list[float], seq: int | None = None) -> None:
         q = normalize_quat(np.asarray(quat, dtype=float))
         now = time.monotonic()
+        self._orientation_rx_count += 1
+        if self._prev_orientation_rx_time is not None:
+            self._last_orientation_inter_arrival_ms = round(
+                (now - self._prev_orientation_rx_time) * 1000.0, 2
+            )
+        self._prev_orientation_rx_time = now
+        elapsed = now - self._orientation_rx_window_start
+        if elapsed >= 1.0:
+            self._orientation_rx_hz = self._orientation_rx_count / elapsed
+            self._orientation_rx_count = 0
+            self._orientation_rx_window_start = now
+        if seq is not None:
+            if self._last_orientation_seq is not None and seq > self._last_orientation_seq + 1:
+                self._orientation_seq_gaps += seq - self._last_orientation_seq - 1
+            self._last_orientation_seq = seq
         with self._lock:
+            # Digital twin must always see the latest device pose. Large jumps
+            # only rebase the control mapping; they must not freeze viz input.
             if self._sync_enabled and self._latest_phone_quat is not None:
                 jump = quat_angle(self._latest_phone_quat, q)
                 if jump > self.config.max_phone_frame_jump_rad:
-                    if self._awaiting_reconnect_pose and self._phone_to_robot_rotation is not None:
+                    # Only the phone path rebases. The MPU mapping is the
+                    # identity (twin frame == robot base frame); rebasing it
+                    # would rotate the mapping away from identity and silently
+                    # break the twin/robot correspondence. For MPU the filter
+                    # reset below absorbs the jump instead.
+                    if (
+                        self._input_device != "mpu6500"
+                        and self._phone_to_robot_rotation is not None
+                    ):
                         old_reference = (
                             self._latest_phone_quat
                             if self._filtered_phone_quat is None
@@ -523,21 +583,22 @@ class OrientationController:
                             @ quat_to_matrix(old_reference)
                             @ quat_to_matrix(q).T
                         )
-                        self._filtered_phone_quat = q.copy()
                         self._phone_rebase_count += 1
                         self._last_phone_rebase_deg = math.degrees(jump)
-                        self._last_status = "phone reference frame rebased after reconnect"
+                        self._last_status = (
+                            f"orientation rebased after {math.degrees(jump):.0f} deg jump"
+                        )
                         logger.info(
-                            "Rebased phone reference frame after reconnect jump of %.1f deg",
+                            "Rebased orientation frame after jump of %.1f deg",
                             math.degrees(jump),
                         )
                     else:
                         self._reject_count += 1
                         self._last_rejection = f"phone_jump: {math.degrees(jump):.1f} deg"
-                        self._rejection_counts["phone_jump"] = self._rejection_counts.get("phone_jump", 0) + 1
-                        if self._reject_count <= 5 or self._reject_count % 30 == 0:
-                            logger.warning("Rejected phone sample: %s", self._last_rejection)
-                        return
+                        self._rejection_counts["phone_jump"] = (
+                            self._rejection_counts.get("phone_jump", 0) + 1
+                        )
+                    self._filtered_phone_quat = q.copy()
             self._awaiting_reconnect_pose = False
             self._latest_phone_quat = q
             self._latest_phone_time = now
@@ -577,7 +638,7 @@ class OrientationController:
             self._calib_phone_quat = phone_q
             self._filtered_phone_quat = phone_q
             self._phone_to_robot_rotation = make_xr_to_robot_rotation(
-                reference_robot_rotation, phone_rotation
+                reference_robot_rotation, phone_rotation, device=self._input_device
             )
             self._target_tip_direction = gripper_tip_in_robot(reference_robot_rotation)
             self._calibrated = True
@@ -757,7 +818,7 @@ class OrientationController:
         filtered = self._filtered_phone_quat
         if mapping is None or filtered is None:
             return None
-        return phone_forward_in_robot(mapping, quat_to_matrix(filtered))
+        return phone_forward_in_robot(mapping, quat_to_matrix(filtered), device=self._input_device)
 
     def _reset_trap_locked(self) -> None:
         self._escape_trap_ticks = 0
@@ -1178,6 +1239,11 @@ class OrientationController:
                 "phone_fresh": self._latest_phone_quat is not None
                 and time.monotonic() - self._latest_phone_time <= self.config.phone_stale_timeout_s,
                 "phone_transport_connected": self._phone_transport_connected,
+                "input_device": self._input_device,
+                "orientation_rx_hz": round(self._orientation_rx_hz, 1),
+                "orientation_inter_arrival_ms": self._last_orientation_inter_arrival_ms,
+                "orientation_seq_gaps": self._orientation_seq_gaps,
+                "control_fps_cfg": self.config.fps,
                 "phone_stale_age_s": (
                     None
                     if self._latest_phone_quat is None
@@ -1335,7 +1401,9 @@ class OrientationController:
                 self._last_status = f"escape planning ({elapsed:.1f}s); holding last command"
             return
         self._housekeep_escape(now)
-        target_direction = phone_forward_in_robot(mapping, quat_to_matrix(filtered_q))
+        target_direction = phone_forward_in_robot(
+            mapping, quat_to_matrix(filtered_q), device=self._input_device
+        )
         with self._lock:
             self._target_tip_direction = target_direction.copy()
 

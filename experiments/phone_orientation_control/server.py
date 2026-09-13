@@ -14,6 +14,9 @@ import asyncio
 import json
 import logging
 import math
+import os
+import sys
+import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
@@ -35,6 +38,7 @@ from controller import (
     load_calibration_limits,
     load_joint_limits,
 )
+from frame_adapter import VERSION as FRAME_ADAPTER_VERSION
 THIS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = THIS_DIR.parents[1]
 DEFAULT_URDF = REPO_ROOT / "SO101" / "so101_new_calib.urdf"
@@ -87,7 +91,9 @@ async def phone_page():
 
 @app.get("/status")
 async def status():
-    return controller.status() if controller else {"status": "controller not started"}
+    if controller is None:
+        return {"status": "controller not started"}
+    return {**controller.status(), "frame_adapter_version": FRAME_ADAPTER_VERSION}
 
 
 @app.get("/ca.crt")
@@ -197,12 +203,20 @@ async def visualization_websocket(ws: WebSocket):
     sent_escape_generation = -1
     try:
         while True:
-            await ws.send_json({"type": "status", **controller.status()})
+            if controller is None:
+                # Same defense in depth as /ws: never crash a viewer on a
+                # missing controller; report and keep the socket alive.
+                await ws.send_json({"type": "status", "status": "controller not started"})
+                await asyncio.sleep(1.0)
+                continue
+            await ws.send_json(
+                {"type": "status", "frame_adapter_version": FRAME_ADAPTER_VERSION, **controller.status()}
+            )
             payload = controller.escape_path_payload()
             if payload is not None and payload[0] != sent_escape_generation:
                 sent_escape_generation, escape_message = payload
                 await ws.send_json(escape_message)
-            await asyncio.sleep(1.0 / 30.0)
+            await asyncio.sleep(1.0 / 60.0)
     except (WebSocketDisconnect, RuntimeError):
         pass
 
@@ -227,6 +241,11 @@ async def command_reply(ws: WebSocket, command: str, result: tuple[bool, str]) -
 async def websocket_endpoint(ws: WebSocket):
     global active_phone_id, active_phone_ws
     await ws.accept()
+    if controller is None:
+        # Defense in depth: the app should only ever serve with a built
+        # controller, but never crash a client connection if that fails.
+        await ws.close(code=1013)
+        return
     client_id = ws.query_params.get("client_id", "")
     resumed = bool(client_id and client_id == active_phone_id)
     if not resumed:
@@ -243,12 +262,19 @@ async def websocket_endpoint(ws: WebSocket):
             msg = json.loads(await ws.receive_text())
             msg_type = msg.get("type")
             if msg_type == "orientation":
-                controller.submit_phone_orientation(msg["quat"])
+                seq = msg.get("seq")
+                try:
+                    seq = int(seq) if seq is not None else None
+                except (TypeError, ValueError):
+                    seq = None
+                controller.submit_phone_orientation(msg["quat"], seq=seq)
             elif msg_type == "ping":
                 await send_phone_json(
                     ws,
                     {"type": "pong", "client_time": msg.get("time"), "server_time": time.time()},
                 )
+            elif msg_type == "device":
+                await command_reply(ws, "device", controller.set_input_device(str(msg.get("kind", ""))))
             elif msg_type == "calibrate":
                 await command_reply(ws, "calibrate", controller.calibrate())
             elif msg_type == "sync":
@@ -298,6 +324,46 @@ async def status_broadcaster() -> None:
                 clients.discard(ws)
                 with suppress(Exception):
                     await ws.close(code=1011, reason="status send timeout")
+
+
+def start_reload_watchdog(directory: Path) -> None:
+    """Auto-restart this server when a .py file in the directory changes.
+
+    Deliberately NOT uvicorn's reload: its child process is spawned without
+    running main(), so the `controller` global stays None in the serving
+    process. Re-executing the script instead guarantees main() runs again and
+    rebuilds the controller.
+    """
+    snapshot = {p: p.stat().st_mtime for p in directory.rglob("*.py")}
+
+    def watch() -> None:
+        nonlocal snapshot
+        while True:
+            time.sleep(1.0)
+            current = {p: p.stat().st_mtime for p in directory.rglob("*.py")}
+            if current != snapshot:
+                changed = sorted(
+                    str(p.relative_to(directory))
+                    for p in current
+                    if current.get(p) != snapshot.get(p)
+                )
+                print(f"\n[reload] {changed} changed; restarting server\n", flush=True)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=watch, name="reload-watchdog", daemon=True).start()
+
+
+def local_ip() -> str:
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        return str(sock.getsockname()[0])
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        if sock is not None:
+            sock.close()
 
 
 def make_controller(
@@ -389,6 +455,11 @@ def parse_args() -> argparse.Namespace:
         "--body-model",
         action="store_true",
         help="forbid the box-composed pseudo-human zones behind the base (obstacles.py)",
+    )
+    parser.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="disable auto-reload on .py changes (default: reload on in dry-run)",
     )
     return parser.parse_args()
 
@@ -505,6 +576,9 @@ def main() -> None:
         )
 
     mode = "HARDWARE" if args.hardware else "DRY-RUN"
+    reload = (not args.hardware) and not args.no_reload
+    if reload:
+        start_reload_watchdog(THIS_DIR)
     lines = [f"\nPhone orientation control [{mode}]"]
     lines += [
         f"\n  phone: https://{addr}:{args.server_port}"
@@ -514,11 +588,17 @@ def main() -> None:
     lines.append(
         f"\n  phone trust (once): open any of the .../ca.crt URLs above on the"
         f"\n    Android phone, install rootCA.crt as a CA certificate, and that"
-        f"\n    https address (LAN or Tailscale 100.x) is trusted without warnings\n"
+        f"\n    https address (LAN or Tailscale 100.x) is trusted without warnings"
+    )
+    lines.append(
+        f"\n  frame_adapter={FRAME_ADAPTER_VERSION} reload={reload}\n"
     )
     print("".join(lines))
     try:
         uvicorn.run(
+            # Auto-reload is handled by start_reload_watchdog (execv) in
+            # main(); uvicorn's own reload would serve in a child process
+            # that never ran main(), leaving the controller global None.
             app,
             host=args.host,
             port=args.server_port,
